@@ -159,6 +159,9 @@ def main():
             "return_1y": num(met.get("52WeekPriceReturnDaily"), digits=2),
             "beta": num(met.get("beta"), digits=3),
             "revenue_growth": num(met.get("revenueGrowthTTMYoy"), digits=2),
+            # EPS growth for PEG: 5-year average where Finnhub has it, else 3-year, else last 12 months.
+            "eps_growth": next((v for v in (num(met.get(k), digits=2) for k in
+                               ("epsGrowth5Y", "epsGrowth3Y", "epsGrowthTTMYoy")) if v is not None), None),
             "net_margin": num(met.get("netProfitMarginTTM"), digits=2),
             "high_52w": num(met.get("52WeekHigh")),
             "low_52w": num(met.get("52WeekLow")),
