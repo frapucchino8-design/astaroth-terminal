@@ -26,6 +26,12 @@ EXCHANGES = {
 TYPES = {"Common Stock", "ADR", "REIT"}
 
 
+def asset_class(symbol, listing):
+    """REITs are their own class: property depreciation makes their P/E and PEG misleading,
+    so the site judges them on yield and price/book instead."""
+    return "reit" if listing.get(symbol, {}).get("type") == "REIT" else "stock"
+
+
 class Finnhub:
     def __init__(self, key, per_minute=54):
         self.s = requests.Session()
@@ -88,9 +94,9 @@ def main():
     if args.limit:
         symbols = symbols[:args.limit]
 
-    # only plain stocks: ETFs and futures live in the same table and are managed by update_funds.py
+    # only shares and REITs: ETFs and futures live in the same table, managed by update_funds.py
     try:
-        existing = {r["symbol"] for r in db.select("symbol", {"region": "eq.US", "asset_class": "eq.stock"})}
+        existing = {r["symbol"] for r in db.select("symbol", {"region": "eq.US", "asset_class": "in.(stock,reit)"})}
     except RuntimeError:
         existing = {r["symbol"] for r in db.select("symbol", {"region": "eq.US"})}
     new_rows = [{
@@ -98,6 +104,7 @@ def main():
         "name": (stocks[s].get("description") or s).title(),
         "exchange": EXCHANGES[stocks[s]["mic"]],
         "region": "US",
+        "asset_class": asset_class(s, stocks),
         "currency": stocks[s].get("currency") or "USD",
     } for s in symbols if s not in existing]
     if new_rows:
@@ -122,6 +129,7 @@ def main():
             batch.append({
                 "symbol": sym,
                 "region": "US",  # every upsert row carries region (NOT NULL), even when only updating
+                "asset_class": asset_class(sym, stocks),
                 "price": num(q["c"]),
                 "change_pct": num(q.get("dp"), digits=3),
                 "quote_updated_at": now_iso(),
@@ -139,7 +147,7 @@ def main():
     # 3. Fundamentals, oldest first ----------------------------------------------------
     try:
         order = [r["symbol"] for r in db.select(
-            "symbol", {"region": "eq.US", "asset_class": "eq.stock"}, order="fundamentals_updated_at.asc.nullsfirst")]
+            "symbol", {"region": "eq.US", "asset_class": "in.(stock,reit)"}, order="fundamentals_updated_at.asc.nullsfirst")]
     except RuntimeError:
         order = [r["symbol"] for r in db.select(
             "symbol", {"region": "eq.US"}, order="fundamentals_updated_at.asc.nullsfirst")]
@@ -158,7 +166,9 @@ def main():
         row = {
             "symbol": sym,
             "region": "US",
+            "asset_class": asset_class(sym, stocks),
             "name": prof.get("name") or None,
+            "pb": num(met.get("pbAnnual") or met.get("pbQuarterly") or met.get("pbTTM"), digits=3),
             "industry": prof.get("finnhubIndustry") or None,
             "sector": finnhub_sector(prof.get("finnhubIndustry")),
             "market_cap_usd_b": num(cap_m or met.get("marketCapitalization"), scale=0.001, digits=3),
