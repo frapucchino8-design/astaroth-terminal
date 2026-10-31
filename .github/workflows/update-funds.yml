@@ -28,3 +28,10 @@ jobs:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      # FFO/AFFO only move once a quarter, so a short budget each night is plenty:
+      # it works oldest-first and comes back round to everything within a week.
+      - name: Rebuild REIT FFO and AFFO
+        run: python scripts/update_reits.py --budget-minutes 20
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
