@@ -88,7 +88,11 @@ def main():
     if args.limit:
         symbols = symbols[:args.limit]
 
-    existing = {r["symbol"] for r in db.select("symbol", {"region": "eq.US"})}
+    # only plain stocks: ETFs and futures live in the same table and are managed by update_funds.py
+    try:
+        existing = {r["symbol"] for r in db.select("symbol", {"region": "eq.US", "asset_class": "eq.stock"})}
+    except RuntimeError:
+        existing = {r["symbol"] for r in db.select("symbol", {"region": "eq.US"})}
     new_rows = [{
         "symbol": s,
         "name": (stocks[s].get("description") or s).title(),
@@ -133,8 +137,12 @@ def main():
     log(f"Prices updated for {done} stocks.")
 
     # 3. Fundamentals, oldest first ----------------------------------------------------
-    order = [r["symbol"] for r in db.select(
-        "symbol", {"region": "eq.US"}, order="fundamentals_updated_at.asc.nullsfirst")]
+    try:
+        order = [r["symbol"] for r in db.select(
+            "symbol", {"region": "eq.US", "asset_class": "eq.stock"}, order="fundamentals_updated_at.asc.nullsfirst")]
+    except RuntimeError:
+        order = [r["symbol"] for r in db.select(
+            "symbol", {"region": "eq.US"}, order="fundamentals_updated_at.asc.nullsfirst")]
     wanted = set(symbols)
     order = [s for s in order if s in wanted]
     log(f"Refreshing fundamentals, oldest first ({len(order)} candidates) …")
