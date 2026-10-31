@@ -178,7 +178,10 @@ def main():
     log(f"Updated {total} Swiss stocks, skipped {skipped} without data.")
 
     if complete_list and not args.limit and total >= 100:
-        existing = {r["symbol"] for r in db.select("symbol", {"region": "eq.Switzerland"})}
+        try:   # only plain shares: Swiss ETFs are managed by update_funds.py
+            existing = {r["symbol"] for r in db.select("symbol", {"region": "eq.Switzerland", "asset_class": "eq.stock"})}
+        except RuntimeError:
+            existing = {r["symbol"] for r in db.select("symbol", {"region": "eq.Switzerland"})}
         gone = existing - set(symbols)
         if gone:
             db.delete_symbols(gone)
