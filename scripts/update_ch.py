@@ -153,6 +153,9 @@ def main():
             "change_pct": round((price / prev - 1) * 100, 3) if prev else None,
             "market_cap_usd_b": round(cap * fx / 1e9, 3) if cap and fx else None,
             "pe": pe,
+            "pb": num(info.get("priceToBook"), digits=3),
+            "asset_class": "reit" if (info.get("sector") == "Real Estate"
+                                      and "REIT" in (info.get("industry") or "")) else "stock",
             "dividend_yield": round(div / price * 100, 3) if div else None,
             "return_1y": num(info.get("52WeekChange"), scale=100, digits=2),
             "beta": num(info.get("beta"), digits=3),
@@ -178,8 +181,8 @@ def main():
     log(f"Updated {total} Swiss stocks, skipped {skipped} without data.")
 
     if complete_list and not args.limit and total >= 100:
-        try:   # only plain shares: Swiss ETFs are managed by update_funds.py
-            existing = {r["symbol"] for r in db.select("symbol", {"region": "eq.Switzerland", "asset_class": "eq.stock"})}
+        try:   # only shares and REITs: Swiss ETFs are managed by update_funds.py
+            existing = {r["symbol"] for r in db.select("symbol", {"region": "eq.Switzerland", "asset_class": "in.(stock,reit)"})}
         except RuntimeError:
             existing = {r["symbol"] for r in db.select("symbol", {"region": "eq.Switzerland"})}
         gone = existing - set(symbols)
