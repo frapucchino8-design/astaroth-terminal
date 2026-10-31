@@ -116,7 +116,7 @@ def main():
     for q in us:
         sym = (q.get("symbol") or "").replace("-", ".")   # Yahoo BRK-B = Finnhub BRK.B
         price = num(raw(q.get("regularMarketPrice")))
-        if existing.get(sym) != "stock" or not price:
+        if existing.get(sym) not in ("stock", "reit") or not price:
             continue                                       # the nightly job decides which US stocks exist
         cap = num(raw(q.get("marketCap")))
         rows.append(clean({"symbol": sym, "region": "US", "price": price,
@@ -127,7 +127,7 @@ def main():
     for q in ch:
         sym = q.get("symbol") or ""
         price = num(raw(q.get("regularMarketPrice")))
-        if not sym.endswith(".SW") or not price or existing.get(sym, "stock") != "stock":
+        if not sym.endswith(".SW") or not price or existing.get(sym, "stock") not in ("stock", "reit"):
             continue
         cap = num(raw(q.get("marketCap")))
         cur = q.get("currency") or "CHF"
