@@ -58,7 +58,7 @@ def ttm(frame, keys, quarters=4):
     return None
 
 
-def reit_row(sym):
+def reit_row(sym, region):
     t = yf.Ticker(sym)
     try:
         info = t.info or {}
@@ -87,12 +87,15 @@ def reit_row(sym):
         return None
 
     ffo = net + da
+    # region is NOT NULL on stocks, and PostgREST upsert runs as INSERT ... ON CONFLICT,
+    # so every row must carry it even though these symbols already exist.
     if ffo <= 0:                            # a loss big enough to swallow depreciation
-        return {"symbol": sym, "ffo_ps": None, "affo_ps": None, "fundamentals_updated_at": now_iso()}
+        return {"symbol": sym, "region": region, "ffo_ps": None, "affo_ps": None, "fundamentals_updated_at": now_iso()}
 
     ffo_ps = ffo / shares
     return {
         "symbol": sym,
+        "region": region,
         "ffo_ps": round(ffo_ps, 4),
         "affo_ps": round(ffo_ps * AFFO_HAIRCUT, 4),
         "fundamentals_updated_at": now_iso(),
@@ -108,10 +111,13 @@ def main():
 
     db = Supabase()
     try:
-        reits = [r["symbol"] for r in db.select(
-            "symbol", {"asset_class": "eq.reit"}, order="fundamentals_updated_at.asc.nullsfirst")]
+        rows = db.select("symbol,region", {"asset_class": "eq.reit"},
+                         order="fundamentals_updated_at.asc.nullsfirst")
     except RuntimeError:
         raise SystemExit("No asset_class column yet — run supabase/setup-update.sql first.")
+    # keep each REIT's region so the upsert can satisfy the NOT NULL constraint
+    region_of = {r["symbol"]: (r.get("region") or "US") for r in rows}
+    reits = [r["symbol"] for r in rows]
 
     if args.limit:
         reits = reits[:args.limit]
@@ -122,7 +128,7 @@ def main():
         if time.monotonic() > deadline:
             log("Time budget used up; the rest continue next run.")
             break
-        row = reit_row(sym)
+        row = reit_row(sym, region_of.get(sym, "US"))
         if row is None:
             skipped += 1
         else:
