@@ -50,7 +50,7 @@ class Supabase:
         if r.status_code >= 300:
             raise RuntimeError(f"Supabase {what} failed ({r.status_code}): {r.text[:500]}")
 
-    def upsert(self, rows, chunk=500):
+    def upsert(self, rows, chunk=100):
         """Insert or update rows by symbol. Only the columns present in a row are written."""
         groups = {}
         for row in rows:
@@ -58,16 +58,25 @@ class Supabase:
         for batch_rows in groups.values():
             for i in range(0, len(batch_rows), chunk):
                 batch = batch_rows[i:i + chunk]
-                for attempt in range(3):
-                    r = self.s.post(
-                        f"{self.url}/stocks?on_conflict=symbol",
-                        json=batch,
-                        headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
-                        timeout=60,
-                    )
+                r = None
+                for attempt in range(5):
+                    try:
+                        r = self.s.post(
+                            f"{self.url}/stocks?on_conflict=symbol",
+                            json=batch,
+                            headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+                            timeout=120,
+                        )
+                    except (requests.exceptions.ReadTimeout,
+                            requests.exceptions.ConnectionError) as e:
+                        log(f"  upsert network error ({e.__class__.__name__}), retry {attempt + 1}/5")
+                        time.sleep(5 * (attempt + 1))
+                        continue
                     if r.status_code < 500:
                         break
                     time.sleep(5 * (attempt + 1))
+                if r is None:
+                    raise RuntimeError("Supabase upsert failed: all 5 attempts timed out or lost the connection.")
                 self._check(r, "upsert")
 
     def select(self, columns, filters=None, order=None):
