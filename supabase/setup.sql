@@ -47,6 +47,14 @@ alter table public.stocks add column if not exists affo_ps        numeric;
 alter table public.stocks add column if not exists eps_growth     numeric;
 alter table public.stocks add column if not exists expense_ratio  numeric;
 
+-- Keep asset_class in a known set. Dropped and recreated so re-running this file
+-- always widens the allowed values, even on an older install.
+alter table public.stocks drop constraint if exists stocks_asset_class_check;
+alter table public.stocks
+  add constraint stocks_asset_class_check
+  check (asset_class is null
+         or asset_class in ('stock','etf','future','reit','index','crypto','fx'));
+
 create index if not exists stocks_region_idx on public.stocks (region);
 create index if not exists stocks_asset_idx on public.stocks (asset_class);
 create index if not exists stocks_fund_updated_idx on public.stocks (fundamentals_updated_at nulls first);
