@@ -4,31 +4,51 @@
 
 -- ---------------------------------------------------------------
 -- 1. Stocks: one row per listing. Filled every night by the GitHub job.
+--    "stocks" now holds every asset class — stocks, ETFs, futures,
+--    REITs, indices, crypto and FX — one row per instrument. The
+--    asset_class column tells the website which kind each one is.
 -- ---------------------------------------------------------------
 create table if not exists public.stocks (
-  symbol                  text primary key,   -- AAPL, BRK.B, NESN.SW
+  symbol                  text primary key,   -- AAPL, NESN.SW, ES=F, ^SSMI, BTC-USD, EURUSD=X
   name                    text,
-  exchange                text,               -- NYSE, NASDAQ, SIX ...
-  region                  text not null,      -- 'US' or 'Switzerland'
+  exchange                text,               -- NYSE, NASDAQ, SIX, CME, EUREX, CoinGecko, ECB
+  region                  text not null,      -- 'US', 'Switzerland', 'Europe', 'Asia', 'Global'
+  asset_class             text,               -- stock | etf | future | reit | index | crypto | fx
   currency                text,               -- trading currency of the price
   sector                  text,               -- one of the screener's sectors
   industry                text,
+  summary                 text,               -- short descriptive blurb for the detail pane
   price                   numeric,
   change_pct              numeric,            -- today's change, in %
-  market_cap_usd_b        numeric,            -- market cap in billions of USD
+  market_cap_usd_b        numeric,            -- market cap in billions of USD (AUM for ETFs)
   pe                      numeric,            -- trailing P/E (null when loss-making)
-  dividend_yield          numeric,            -- in %
+  pb                      numeric,            -- price / book
+  ffo_ps                  numeric,            -- Funds From Operations per share (REITs)
+  affo_ps                 numeric,            -- Adjusted FFO per share (REITs)
+  dividend_yield          numeric,            -- in % (distribution yield for ETFs)
   return_1y               numeric,            -- 52-week price return, in %
   beta                    numeric,
   revenue_growth          numeric,            -- year over year, in %
+  eps_growth              numeric,            -- EPS growth used for PEG, in %
   net_margin              numeric,            -- in %
+  expense_ratio           numeric,            -- in % (ETFs)
   high_52w                numeric,
   low_52w                 numeric,
   quote_updated_at        timestamptz,
   fundamentals_updated_at timestamptz
 );
 
+-- Older installs: add the new columns without touching existing data.
+alter table public.stocks add column if not exists asset_class    text;
+alter table public.stocks add column if not exists summary        text;
+alter table public.stocks add column if not exists pb             numeric;
+alter table public.stocks add column if not exists ffo_ps         numeric;
+alter table public.stocks add column if not exists affo_ps        numeric;
+alter table public.stocks add column if not exists eps_growth     numeric;
+alter table public.stocks add column if not exists expense_ratio  numeric;
+
 create index if not exists stocks_region_idx on public.stocks (region);
+create index if not exists stocks_asset_idx on public.stocks (asset_class);
 create index if not exists stocks_fund_updated_idx on public.stocks (fundamentals_updated_at nulls first);
 
 -- Only signed-in users can read stocks. Nobody can write from the website;
@@ -57,8 +77,6 @@ create policy "Users can read their own profile"
   to authenticated
   using (auth.uid() = id);
 
--- Create the profile automatically when someone signs up.
--- The website sends the username in the sign-up metadata.
 create or replace function public.handle_new_user()
 returns trigger
 language plpgsql
