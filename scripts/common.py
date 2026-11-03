@@ -1,16 +1,17 @@
-"""Shared helpers for the nightly stock update: Supabase access and sector mapping."""
+"""Shared helpers for the nightly data update: Supabase access, sector mapping, FX rates."""
 import os
 import sys
 import time
 from datetime import datetime, timezone
 
 import requests
-from urllib3.util.retry import Retry
 
 
-def env(name):
+def env(name, default=None):
     value = os.environ.get(name, "").strip()
     if not value:
+        if default is not None:
+            return default
         sys.exit(f"Missing {name}. Add it under GitHub → Settings → Secrets and variables → Actions.")
     return value
 
@@ -37,69 +38,37 @@ def log(msg):
 class Supabase:
     """Minimal client for the PostgREST API, using the service_role key."""
 
-    def __init__(self, timeout=180):
+    def __init__(self):
         self.url = env("SUPABASE_URL").rstrip("/") + "/rest/v1"
-        self.timeout = timeout          # 60s was too tight for large writes
         key = env("SUPABASE_SERVICE_ROLE_KEY")
         self.s = requests.Session()
         self.s.headers.update({"apikey": key, "Content-Type": "application/json"})
-        if key.startswith("eyJ"):  # legacy service_role key (a JWT); new sb_secret_ keys go in apikey only
+        if key.startswith("eyJ"):
             self.s.headers["Authorization"] = f"Bearer {key}"
-        # Reconnect rather than reusing a pooled socket the other end has quietly dropped.
-        adapter = requests.adapters.HTTPAdapter(
-            max_retries=Retry(total=3, connect=3, read=0, backoff_factor=2,
-                              status_forcelist=[], allowed_methods=None),
-            pool_connections=4, pool_maxsize=4)
-        self.s.mount("https://", adapter)
 
     def _check(self, r, what):
         if r.status_code >= 300:
             raise RuntimeError(f"Supabase {what} failed ({r.status_code}): {r.text[:500]}")
 
-    def _send(self, method, path, what, tries=5, timeout=None, **kw):
-        """One request, retried on both server errors and network failures.
-
-        The old version only retried on HTTP 5xx, so a read timeout — which raises out of
-        requests rather than returning a response — ended the whole run. Timeouts are the
-        common failure here: Supabase occasionally takes more than a minute to acknowledge a
-        large write, especially when another job is writing at the same time.
-
-        Retrying a write is safe because every write we make is idempotent: upsert merges on
-        the symbol, and delete is by symbol too. If the server did apply a write we never
-        heard back about, doing it again changes nothing.
-        """
-        timeout = timeout or self.timeout
-        last = None
-        for attempt in range(tries):
-            try:
-                r = self.s.request(method, f"{self.url}/{path}", timeout=timeout, **kw)
-            except requests.RequestException as e:
-                last = e
-                wait = min(60, 5 * 2 ** attempt)
-                log(f"  {what}: {type(e).__name__}, retrying in {wait}s ({attempt + 1}/{tries})")
-                time.sleep(wait)
-                continue
-            if r.status_code < 500:
-                self._check(r, what)
-                return r
-            last = RuntimeError(f"{r.status_code}: {r.text[:200]}")
-            wait = min(60, 5 * 2 ** attempt)
-            log(f"  {what}: server said {r.status_code}, retrying in {wait}s ({attempt + 1}/{tries})")
-            time.sleep(wait)
-        raise RuntimeError(f"Supabase {what} failed after {tries} tries: {last}")
-
-    def upsert(self, rows, chunk=200):
+    def upsert(self, rows, chunk=500):
         """Insert or update rows by symbol. Only the columns present in a row are written."""
         groups = {}
-        for row in rows:  # PostgREST needs the same columns in every row of one request
+        for row in rows:
             groups.setdefault(tuple(sorted(row)), []).append(row)
         for batch_rows in groups.values():
             for i in range(0, len(batch_rows), chunk):
-                self._send(
-                    "POST", "stocks?on_conflict=symbol", "upsert",
-                    json=batch_rows[i:i + chunk],
-                    headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
-                )
+                batch = batch_rows[i:i + chunk]
+                for attempt in range(3):
+                    r = self.s.post(
+                        f"{self.url}/stocks?on_conflict=symbol",
+                        json=batch,
+                        headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+                        timeout=60,
+                    )
+                    if r.status_code < 500:
+                        break
+                    time.sleep(5 * (attempt + 1))
+                self._check(r, "upsert")
 
     def select(self, columns, filters=None, order=None):
         """Read every matching row, 1000 at a time."""
@@ -108,8 +77,13 @@ class Supabase:
         if order:
             params["order"] = order
         while True:
-            r = self._send("GET", "stocks", "select", params=params,
-                           headers={"Range-Unit": "items", "Range": f"{start}-{start + step - 1}"})
+            r = self.s.get(
+                f"{self.url}/stocks",
+                params=params,
+                headers={"Range-Unit": "items", "Range": f"{start}-{start + step - 1}"},
+                timeout=60,
+            )
+            self._check(r, "select")
             page = r.json()
             out.extend(page)
             if len(page) < step:
@@ -121,7 +95,17 @@ class Supabase:
         for i in range(0, len(symbols), chunk):
             part = symbols[i:i + chunk]
             quoted = ",".join('"' + s.replace('"', '') + '"' for s in part)
-            self._send("DELETE", "stocks", "delete", params={"symbol": f"in.({quoted})"})
+            r = self.s.delete(f"{self.url}/stocks", params={"symbol": f"in.({quoted})"}, timeout=60)
+            self._check(r, "delete")
+
+    def delete_asset_class(self, asset_class, keep):
+        """Remove rows of this asset_class whose symbol isn't in `keep` — housekeeping."""
+        keep = set(keep)
+        rows = self.select("symbol", {"asset_class": f"eq.{asset_class}"})
+        gone = [r["symbol"] for r in rows if r["symbol"] not in keep]
+        if gone:
+            self.delete_symbols(gone)
+        return len(gone)
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +125,6 @@ YAHOO_SECTORS = {
     "Real Estate": "Real Estate",
 }
 
-# Finnhub gives an industry ("Banking", "Semiconductors" ...). Matched by keyword, first hit wins.
 FINNHUB_RULES = [
     ("Real Estate", ["real estate", "reit"]),
     ("Utilities", ["utilit"]),
@@ -168,3 +151,40 @@ def finnhub_sector(industry):
         if any(w in text for w in words):
             return sector
     return "Other"
+
+
+# ---------------------------------------------------------------------------
+# FX rates (quoted vs USD). Fed by update_fx.py but cached here for other scripts.
+# ---------------------------------------------------------------------------
+_FX_CACHE = {"USD": 1.0}
+
+
+def to_usd(currency, yf_fallback=True):
+    """Current rate from a currency to USD. Cached in-process."""
+    if not currency:
+        return None
+    if currency in _FX_CACHE:
+        return _FX_CACHE[currency]
+    # Try ECB first (no API key, open data)
+    try:
+        r = requests.get(
+            f"https://api.frankfurter.app/latest?from={currency}&to=USD",
+            timeout=10,
+        )
+        if r.ok:
+            rate = r.json().get("rates", {}).get("USD")
+            if rate:
+                _FX_CACHE[currency] = float(rate)
+                return _FX_CACHE[currency]
+    except requests.RequestException:
+        pass
+    if yf_fallback:
+        try:
+            import yfinance as yf
+            hist = yf.Ticker(f"{currency}USD=X").history(period="5d")
+            _FX_CACHE[currency] = float(hist["Close"].dropna().iloc[-1])
+            return _FX_CACHE[currency]
+        except Exception:
+            pass
+    _FX_CACHE[currency] = None
+    return None

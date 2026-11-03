@@ -5,6 +5,7 @@ The list of SIX shares is put together from three sources, so one failing doesn'
   2. Finnhub's symbol list for SIX (if the free plan allows it)
   3. A built-in list of about 230 SIX shares
 Yahoo is unofficial: fine for a personal project, not for a paid public site.
+Each row carries asset_class = "stock" (or "reit" when the sector says so).
 """
 import argparse
 import os
@@ -13,7 +14,7 @@ import time
 import requests
 import yfinance as yf
 
-from common import YAHOO_SECTORS, Supabase, log, now_iso, num
+from common import YAHOO_SECTORS, Supabase, log, now_iso, num, to_usd
 
 # Built-in list of SIX-listed shares (Yahoo symbols without ".SW"). Unknown ones are skipped.
 BUILTIN = """
@@ -32,7 +33,6 @@ ZUBN ZUGER ZUGN ZURN ZWM
 
 
 def yahoo_list():
-    """Every equity Yahoo lists on SIX, using its screener (up to 250 per page)."""
     try:
         from yfinance import EquityQuery
         q = EquityQuery("and", [EquityQuery("eq", ["region", "ch"]), EquityQuery("is-in", ["exchange", "EBS"])])
@@ -80,20 +80,6 @@ def swiss_symbols():
     return symbols, complete
 
 
-FX = {"USD": 1.0}
-
-
-def to_usd(currency):
-    """Exchange rate from a currency to USD, from Yahoo (e.g. CHFUSD=X)."""
-    if currency not in FX:
-        try:
-            hist = yf.Ticker(f"{currency}USD=X").history(period="5d")
-            FX[currency] = float(hist["Close"].dropna().iloc[-1])
-        except Exception:
-            FX[currency] = None
-    return FX[currency]
-
-
 def fetch_info(sym):
     for attempt in range(3):
         try:
@@ -109,8 +95,6 @@ def fetch_info(sym):
 
 
 def eps_growth(info, pe):
-    """Yearly EPS growth in %, for PEG. Prefer the growth implied by Yahoo's PEG ratio
-    (based on analysts' 5-year estimates); otherwise use the latest year-on-year earnings growth."""
     peg = num(info.get("trailingPegRatio") or info.get("pegRatio"))
     if pe and peg and peg > 0:
         return round(pe / peg, 2)
@@ -141,21 +125,23 @@ def main():
         div = num(info.get("dividendRate") or info.get("trailingAnnualDividendRate"))
         pe = num(info.get("trailingPE"), digits=2)
         pe = pe if pe and pe > 0 else None
+        sector = YAHOO_SECTORS.get(info.get("sector"), "Other" if info.get("sector") else None)
+        is_reit = sector == "Real Estate" or (info.get("industry") or "").lower().startswith("reit")
         rows.append({
             "symbol": sym,
             "name": info.get("longName") or info.get("shortName") or sym,
             "exchange": "SIX",
             "region": "Switzerland",
+            "asset_class": "reit" if is_reit else "stock",
             "currency": cur,
-            "sector": YAHOO_SECTORS.get(info.get("sector"), "Other" if info.get("sector") else None),
+            "sector": sector,
             "industry": info.get("industry"),
+            "summary": (info.get("longBusinessSummary") or "").strip()[:800] or None,
             "price": price,
             "change_pct": round((price / prev - 1) * 100, 3) if prev else None,
             "market_cap_usd_b": round(cap * fx / 1e9, 3) if cap and fx else None,
             "pe": pe,
-            "pb": num(info.get("priceToBook"), digits=3),
-            "asset_class": "reit" if (info.get("sector") == "Real Estate"
-                                      and "REIT" in (info.get("industry") or "")) else "stock",
+            "pb": num(info.get("priceToBook"), digits=2),
             "dividend_yield": round(div / price * 100, 3) if div else None,
             "return_1y": num(info.get("52WeekChange"), scale=100, digits=2),
             "beta": num(info.get("beta"), digits=3),
@@ -169,7 +155,7 @@ def main():
         })
         if i % 25 == 0:
             log(f"  {i}/{len(symbols)}")
-        if len(rows) >= 50:  # save as we go, so a crash late in the run keeps earlier work
+        if len(rows) >= 50:
             db.upsert(rows)
             saved += len(rows)
             rows = []
@@ -181,10 +167,8 @@ def main():
     log(f"Updated {total} Swiss stocks, skipped {skipped} without data.")
 
     if complete_list and not args.limit and total >= 100:
-        try:   # only shares and REITs: Swiss ETFs are managed by update_funds.py
-            existing = {r["symbol"] for r in db.select("symbol", {"region": "eq.Switzerland", "asset_class": "in.(stock,reit)"})}
-        except RuntimeError:
-            existing = {r["symbol"] for r in db.select("symbol", {"region": "eq.Switzerland"})}
+        existing = {r["symbol"] for r in db.select(
+            "symbol", {"region": "eq.Switzerland", "asset_class": "in.(stock,reit)"})}
         gone = existing - set(symbols)
         if gone:
             db.delete_symbols(gone)
