@@ -3,9 +3,8 @@ name: Fast refresh (every 5 min, market hours)
 # Runs every 5 minutes between 07:00 and 21:55 UTC, Monday to Friday. The window
 # covers both DST and non-DST versions of the US and Swiss market days.
 #
-# GitHub Actions schedules its 5-minute crons on a best-effort basis — the runner
-# queue can delay a tick by 5–15 minutes under load. For true 5-minute cadence,
-# point a free pinger such as cron-job.org at the "workflow_dispatch" endpoint.
+# Each asset class runs in its own parallel job, so one slow or failing step
+# never pushes the whole run over the 5-minute timeout.
 on:
   schedule:
     - cron: "*/5 7-21 * * 1-5"
@@ -14,10 +13,10 @@ on:
       what:
         description: "Which fast jobs to run"
         type: choice
-        options: [all, prices, swiss, futures, indices, crypto, fx, eurex]
+        options: [all, swiss, futures, indices, crypto, fx, eurex]
         default: all
 
-# Only one run at a time: if a tick is still finishing when the next fires,
+# One tick at a time: if a run is still finishing when the next cron fires,
 # the newer one waits, so we never write stale snapshots over fresh ones.
 concurrency:
   group: fast-refresh
@@ -29,12 +28,11 @@ env:
   SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
 jobs:
-  # All the fast jobs run inside a single runner, so GitHub only has to spin
-  # one container up every 5 minutes. Each step is independent — a Yahoo hiccup
-  # on one asset class doesn't stop the others.
-  refresh:
+  swiss:
+    if: ${{ github.event_name == 'schedule' || inputs.what == 'all' || inputs.what == 'swiss' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -43,33 +41,81 @@ jobs:
           cache: pip
           cache-dependency-path: scripts/requirements.txt
       - run: pip install -r scripts/requirements.txt
+      - run: python scripts/update_ch_prices.py --deadline 330
 
-      - name: Swiss prices
-        if: ${{ github.event_name == 'schedule' || inputs.what == 'all' || inputs.what == 'swiss' || inputs.what == 'prices' }}
-        continue-on-error: true
-        run: python scripts/update_ch_prices.py
+  futures:
+    if: ${{ github.event_name == 'schedule' || inputs.what == 'all' || inputs.what == 'futures' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install -r scripts/requirements.txt
+      - run: python scripts/update_futures.py --fast
 
-      - name: Futures
-        if: ${{ github.event_name == 'schedule' || inputs.what == 'all' || inputs.what == 'futures' || inputs.what == 'prices' }}
-        continue-on-error: true
-        run: python scripts/update_futures.py
+  indices:
+    if: ${{ github.event_name == 'schedule' || inputs.what == 'all' || inputs.what == 'indices' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install -r scripts/requirements.txt
+      - run: python scripts/update_indices.py --fast
 
-      - name: Indices
-        if: ${{ github.event_name == 'schedule' || inputs.what == 'all' || inputs.what == 'indices' || inputs.what == 'prices' }}
-        continue-on-error: true
-        run: python scripts/update_indices.py
+  crypto:
+    if: ${{ github.event_name == 'schedule' || inputs.what == 'all' || inputs.what == 'crypto' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install -r scripts/requirements.txt
+      - run: python scripts/update_crypto.py
 
-      - name: Crypto
-        if: ${{ github.event_name == 'schedule' || inputs.what == 'all' || inputs.what == 'crypto' || inputs.what == 'prices' }}
-        continue-on-error: true
-        run: python scripts/update_crypto.py
+  fx:
+    if: ${{ github.event_name == 'schedule' || inputs.what == 'all' || inputs.what == 'fx' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install -r scripts/requirements.txt
+      - run: python scripts/update_fx.py --fast
 
-      - name: FX
-        if: ${{ github.event_name == 'schedule' || inputs.what == 'all' || inputs.what == 'fx' || inputs.what == 'prices' }}
-        continue-on-error: true
-        run: python scripts/update_fx.py
-
-      - name: Eurex (best effort)
-        if: ${{ github.event_name == 'schedule' || inputs.what == 'all' || inputs.what == 'eurex' || inputs.what == 'prices' }}
-        continue-on-error: true
-        run: python scripts/update_eurex.py
+  eurex:
+    if: ${{ github.event_name == 'schedule' || inputs.what == 'all' || inputs.what == 'eurex' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install -r scripts/requirements.txt
+      # --fast skips the per-contract daily-history download (22 extra large CSVs),
+      # which is what pushed this job past the 5-minute timeout.
+      - run: python scripts/update_eurex.py --fast --deadline 210
