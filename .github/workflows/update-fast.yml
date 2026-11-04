@@ -13,7 +13,7 @@ on:
       what:
         description: "Which fast jobs to run"
         type: choice
-        options: [all, swiss, futures, indices, crypto, fx, eurex]
+        options: [all, held, swiss, futures, indices, crypto, fx, eurex]
         default: all
 
 # One tick at a time: if a run is still finishing when the next cron fires,
@@ -42,6 +42,22 @@ jobs:
           cache-dependency-path: scripts/requirements.txt
       - run: pip install -r scripts/requirements.txt
       - run: python scripts/update_ch_prices.py --deadline 330
+
+  # Everything anyone actually holds — a few hundred symbols, not 11,000.
+  held:
+    if: ${{ github.event_name == 'schedule' || inputs.what == 'all' || inputs.what == 'held' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install -r scripts/requirements.txt
+      - run: python scripts/update_held.py --deadline 330
 
   futures:
     if: ${{ github.event_name == 'schedule' || inputs.what == 'all' || inputs.what == 'futures' }}
