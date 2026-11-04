@@ -82,6 +82,8 @@ INDICES = [
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--fast", action="store_true",
+                    help="Prices only — skip 1-year history. For the 5-minute workflow.")
     args = ap.parse_args()
 
     db = Supabase()
@@ -96,14 +98,7 @@ def main():
         except Exception:
             skipped += 1
             continue
-        y1 = None
-        try:
-            hist = yf.Ticker(sym).history(period="1y")["Close"].dropna()
-            if len(hist) > 20:
-                y1 = round((price / float(hist.iloc[0]) - 1) * 100, 2)
-        except Exception:
-            pass
-        rows.append({
+        row = {
             "symbol": sym,
             "name": name,
             "exchange": "Index",
@@ -114,23 +109,30 @@ def main():
             "industry": "Index",
             "price": round(price, 4),
             "change_pct": round((price / prev - 1) * 100, 3) if prev else None,
-            "return_1y": y1,
-            "high_52w": hi,
-            "low_52w": lo,
             "quote_updated_at": now_iso(),
-            "fundamentals_updated_at": now_iso(),
-        })
+        }
+        if not args.fast:
+            y1 = None
+            try:
+                hist = yf.Ticker(sym).history(period="1y")["Close"].dropna()
+                if len(hist) > 20:
+                    y1 = round((price / float(hist.iloc[0]) - 1) * 100, 2)
+            except Exception:
+                pass
+            row.update({"return_1y": y1, "high_52w": hi, "low_52w": lo,
+                        "fundamentals_updated_at": now_iso()})
+        rows.append(row)
         if i % 10 == 0:
             log(f"  indices {i}/{len(rows_in)}")
         if len(rows) >= 40:
             db.upsert(rows); rows = []
-        time.sleep(0.3)
+        time.sleep(0.1 if args.fast else 0.3)
 
     if rows:
         db.upsert(rows)
     log(f"Updated {len(rows_in) - skipped} indices, skipped {skipped}.")
 
-    if not args.limit:
+    if not args.limit and not args.fast:
         gone = db.delete_asset_class("index", {r[0] for r in INDICES})
         if gone:
             log(f"Removed {gone} indices no longer on the list.")
