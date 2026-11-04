@@ -115,6 +115,8 @@ def fast(sym):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--fast", action="store_true",
+                    help="Prices only — skip per-symbol info and 1-year history. For the 5-minute workflow.")
     args = ap.parse_args()
 
     db = Supabase()
@@ -123,22 +125,13 @@ def main():
 
     for i, (sym, name, group, exch, cur, region) in enumerate(rows_in, 1):
         price, prev = fast(sym)
-        info = fetch_info(sym) if price else {}
+        info = {} if args.fast else (fetch_info(sym) if price else {})
         price = price or num(info.get("regularMarketPrice"))
         prev = prev or num(info.get("regularMarketPreviousClose") or info.get("previousClose"))
         if not price:
             skipped += 1
             continue
-        hi, lo = num(info.get("fiftyTwoWeekHigh")), num(info.get("fiftyTwoWeekLow"))
-        y1 = None
-        if hi and lo:
-            try:
-                hist = yf.Ticker(sym).history(period="1y")["Close"].dropna()
-                if len(hist) > 20:
-                    y1 = round((price / float(hist.iloc[0]) - 1) * 100, 2)
-            except Exception:
-                pass
-        rows.append({
+        row = {
             "symbol": sym,
             "name": name,
             "exchange": exch,
@@ -149,23 +142,33 @@ def main():
             "industry": group,
             "price": price,
             "change_pct": round((price / prev - 1) * 100, 3) if prev else None,
-            "return_1y": y1,
-            "high_52w": hi,
-            "low_52w": lo,
             "quote_updated_at": now_iso(),
-            "fundamentals_updated_at": now_iso(),
-        })
+        }
+        if not args.fast:
+            hi, lo = num(info.get("fiftyTwoWeekHigh")), num(info.get("fiftyTwoWeekLow"))
+            y1 = None
+            if hi and lo:
+                try:
+                    hist = yf.Ticker(sym).history(period="1y")["Close"].dropna()
+                    if len(hist) > 20:
+                        y1 = round((price / float(hist.iloc[0]) - 1) * 100, 2)
+                except Exception:
+                    pass
+            row.update({"return_1y": y1, "high_52w": hi, "low_52w": lo,
+                        "fundamentals_updated_at": now_iso()})
+        rows.append(row)
         if i % 10 == 0:
             log(f"  futures {i}/{len(rows_in)}")
         if len(rows) >= 40:
             db.upsert(rows); rows = []
-        time.sleep(0.4)
+        time.sleep(0.1 if args.fast else 0.4)
 
     if rows:
         db.upsert(rows)
     log(f"Updated {len(rows_in) - skipped} futures, skipped {skipped}.")
 
-    if not args.limit:
+    # Housekeeping only on the full nightly run — the fast path never prunes.
+    if not args.limit and not args.fast:
         gone = db.delete_asset_class("future", {r[0] for r in FUTURES})
         if gone:
             log(f"Removed {gone} futures no longer on the list.")
