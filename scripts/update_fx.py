@@ -26,7 +26,10 @@ CURRENCY_NAMES = {
 
 
 def main():
-    ap = argparse.ArgumentParser(); ap.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--fast", action="store_true",
+                    help="Prices only — skip the per-currency 1-year history. For the 5-minute workflow.")
+    args = ap.parse_args()
     db = Supabase()
 
     try:
@@ -38,20 +41,24 @@ def main():
     if base != "USD" or not rates:
         raise SystemExit(f"Unexpected response: {latest}")
 
-    # 1-year change for each currency, one call per currency (small set, polite 1s gap)
+    # 1-year change for each currency, one call per currency (small set, polite 1s gap).
+    # Skipped on the fast path — the nightly run refreshes it.
     one_year = {}
-    for cur in rates:
-        try:
-            h = requests.get(f"{FRANKFURTER}/2025-11-03..?from=USD&to={cur}", timeout=30).json()
-            series = h.get("rates", {})
-            if series:
-                first = next(iter(sorted(series)))
-                y0 = series[first].get(cur)
-                if y0:
-                    one_year[cur] = round((rates[cur] / y0 - 1) * 100, 2)
-        except (requests.RequestException, ValueError):
-            pass
-        time.sleep(1)
+    if not args.fast:
+        from datetime import date as _d, timedelta
+        start = (_d.today() - timedelta(days=365)).isoformat()
+        for cur in rates:
+            try:
+                h = requests.get(f"{FRANKFURTER}/{start}..?from=USD&to={cur}", timeout=30).json()
+                series = h.get("rates", {})
+                if series:
+                    first = next(iter(sorted(series)))
+                    y0 = series[first].get(cur)
+                    if y0:
+                        one_year[cur] = round((rates[cur] / y0 - 1) * 100, 2)
+            except (requests.RequestException, ValueError):
+                pass
+            time.sleep(1)
 
     rows, kept = [], set()
     for cur, rate_from_usd in rates.items():
@@ -59,7 +66,7 @@ def main():
         price = round(1.0 / float(rate_from_usd), 6)
         sym = f"{cur}USD=X"
         kept.add(sym)
-        rows.append({
+        row = {
             "symbol": sym,
             "name": f"{CURRENCY_NAMES.get(cur, cur)} / US Dollar",
             "exchange": "ECB",
@@ -69,17 +76,20 @@ def main():
             "sector": "FX",
             "industry": "FX",
             "price": price,
-            "return_1y": one_year.get(cur),
             "quote_updated_at": now_iso(),
-            "fundamentals_updated_at": now_iso(),
-        })
+        }
+        if not args.fast:
+            row["return_1y"] = one_year.get(cur)
+            row["fundamentals_updated_at"] = now_iso()
+        rows.append(row)
 
     db.upsert(rows)
     log(f"Updated {len(rows)} FX pairs (ECB rates as of {date}).")
 
-    gone = db.delete_asset_class("fx", kept)
-    if gone:
-        log(f"Removed {gone} FX pairs no longer published.")
+    if not args.fast:
+        gone = db.delete_asset_class("fx", kept)
+        if gone:
+            log(f"Removed {gone} FX pairs no longer published.")
 
 
 if __name__ == "__main__":
