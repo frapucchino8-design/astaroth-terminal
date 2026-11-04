@@ -1,162 +1,174 @@
-"""Eurex futures — best-effort scraper of Deutsche Börse's free MiFID II delayed data.
+"""Eurex futures via Stooq — end-of-day CSV, one call per contract.
 
-Deutsche Börse publishes 15-minute-delayed pre- and post-trade data for every Eurex
-contract, free of charge, under its MiFIR Art. 13 (1) obligation. The file service
-updates once a minute and files stay available until midnight the next business day:
-    https://mfs.deutsche-boerse.com/DEUR-posttrade
+Stooq hosts continuous Eurex futures under <lowercase-product-code>.f, with two
+free CSV endpoints:
+    https://stooq.com/q/l/?s=fsmi.f&f=sd2t2ohlcv&h&e=csv   -> today's quote
+    https://stooq.com/q/d/l/?s=fsmi.f&i=d                  -> daily history
+We fetch both: the quote for today's price and OHLC, the history for yesterday's
+close (so we can compute change_pct) and for 52-week high/low and 1-year return.
 
-The exact file-naming inside the service isn't publicly documented, so this script
-tries several patterns and falls back to the public view-service JSON used by
-mvs.deutsche-boerse.com. It only inserts rows it can read with confidence.
+Stooq updates after the Eurex close, so running this hourly or once an evening is
+plenty. On the fast 5-minute workflow it's harmless — it just rewrites the same
+EOD numbers until the next close.
 
-Terms: Deutsche Börse's free delayed data is for personal and informational use.
-Check mds.deutsche-boerse.com/mds-en/disclaimer before you redistribute it on a
-public page. For a public commercial site, you need a paid Eurex licence.
+Stooq's terms allow personal use. For a public commercial site, you need a paid
+Eurex licence.
 """
 import argparse
-import datetime as dt
-import gzip
+import csv
 import io
-import json
 import time
 
 import requests
 
 from common import Supabase, log, now_iso, num
 
-MFS_BASE = "https://mfs.deutsche-boerse.com/DEUR-posttrade"
-MVS_API = "https://mvs.deutsche-boerse.com/api"  # view-service backend, same data in a different shape
+QUOTE = "https://stooq.com/q/l/?s={sym}&f=sd2t2ohlcvn&h&e=csv"
+HISTORY = "https://stooq.com/q/d/l/?s={sym}&i=d"
+UA = {"User-Agent": "Mozilla/5.0 (astaroth-terminal)"}
 
-# One row per contract we want. The script looks up each by product_id (Eurex) + ISIN.
+# Stooq symbol, long name, Eurex group, currency, region.
+# All symbols follow "<lowercase-eurex-product-code>.f" — verified for fsmi.f.
 EUREX = [
-    # product_id, long name, ISIN (underlying index/bond), region, currency
-    ("FSMI", "SMI Future", "CH0008616432", "Switzerland", "CHF"),
-    ("FSMM", "SMI MID Future", "CH0019396990", "Switzerland", "CHF"),
-    ("FSLI", "SLI Future", "CH0030252883", "Switzerland", "CHF"),
-    ("FESX", "Euro Stoxx 50 Future", "EU0009658145", "Europe", "EUR"),
-    ("FDAX", "DAX Future", "DE0008469008", "Europe", "EUR"),
-    ("FDXM", "Mini-DAX Future", "DE0008469008", "Europe", "EUR"),
-    ("FMDX", "MDAX Future", "DE0008467416", "Europe", "EUR"),
-    ("FTDX", "TecDAX Future", "DE0007203275", "Europe", "EUR"),
-    ("FSTX", "Stoxx Europe 50 Future", "EU0009658152", "Europe", "EUR"),
-    ("FXXP", "Stoxx Europe 600 Future", "EU0009658202", "Europe", "EUR"),
-    ("FSMI", "SMI Future", "CH0008616432", "Switzerland", "CHF"),
-    # Bund family
-    ("FGBL", "Euro-Bund Future", "DE0001102333", "Europe", "EUR"),
-    ("FGBM", "Euro-Bobl Future", "DE0001141828", "Europe", "EUR"),
-    ("FGBS", "Euro-Schatz Future", "DE0001104867", "Europe", "EUR"),
-    ("FGBX", "Euro-Buxl Future", "DE0001102580", "Europe", "EUR"),
-    ("FBTP", "Long BTP Future", "IT0005506919", "Europe", "EUR"),
-    ("FOAT", "Long OAT Future", "FR0014004301", "Europe", "EUR"),
+    # Equity-index futures
+    ("fsmi.f",  "SMI Future",                    "Equity Index", "CHF", "Switzerland"),
+    ("fsmm.f",  "SMI MID Future",                "Equity Index", "CHF", "Switzerland"),
+    ("fsli.f",  "SLI Future",                    "Equity Index", "CHF", "Switzerland"),
+    ("fsmd.f",  "SMI Dividend Future",           "Equity Index", "CHF", "Switzerland"),
+    ("fdax.f",  "DAX Future",                    "Equity Index", "EUR", "Europe"),
+    ("fdxm.f",  "Mini-DAX Future",               "Equity Index", "EUR", "Europe"),
+    ("fmdx.f",  "MDAX Future",                   "Equity Index", "EUR", "Europe"),
+    ("ftdx.f",  "TecDAX Future",                 "Equity Index", "EUR", "Europe"),
+    ("fesx.f",  "Euro Stoxx 50 Future",          "Equity Index", "EUR", "Europe"),
+    ("fstx.f",  "Stoxx Europe 50 Future",        "Equity Index", "EUR", "Europe"),
+    ("fxxp.f",  "Stoxx Europe 600 Future",       "Equity Index", "EUR", "Europe"),
+    ("fsto.f",  "Stoxx Europe 600 Oil & Gas",    "Equity Index", "EUR", "Europe"),
+    ("fstb.f",  "Stoxx Europe 600 Banks",        "Equity Index", "EUR", "Europe"),
+    # Fixed-income futures
+    ("fgbl.f",  "Euro-Bund Future",              "Rates",        "EUR", "Europe"),
+    ("fgbm.f",  "Euro-Bobl Future",              "Rates",        "EUR", "Europe"),
+    ("fgbs.f",  "Euro-Schatz Future",            "Rates",        "EUR", "Europe"),
+    ("fgbx.f",  "Euro-Buxl Future",              "Rates",        "EUR", "Europe"),
+    ("fbtp.f",  "Long BTP Future",               "Rates",        "EUR", "Europe"),
+    ("fbts.f",  "Short BTP Future",              "Rates",        "EUR", "Europe"),
+    ("foat.f",  "Long OAT Future",               "Rates",        "EUR", "Europe"),
+    ("fbon.f",  "Buoni del Tesoro Future",       "Rates",        "EUR", "Europe"),
+    # Volatility
+    ("fvs.f",   "VSTOXX Future",                 "Volatility",   "EUR", "Europe"),
 ]
 
 
-def fetch_json(url, timeout=30):
-    try:
-        r = requests.get(url, timeout=timeout, headers={"User-Agent": "astaroth-terminal/1.0"})
-        if not r.ok:
-            return None
-        ct = r.headers.get("Content-Type", "")
-        body = r.content
-        if ct.startswith("application/gzip") or url.endswith(".gz"):
-            body = gzip.decompress(body)
+def fetch_csv(url, retries=2, timeout=12):
+    """One GET, retried only on a network error — a clean non-OK reply is final,
+    so a wrong ticker costs one request instead of three plus back-off."""
+    for attempt in range(retries):
         try:
-            return json.loads(body)
-        except ValueError:
-            # Some endpoints wrap JSON in a tiny HTML page or an array of objects per line.
-            text = body.decode("utf-8", errors="replace").strip()
-            if text.startswith("["):
-                return json.loads(text)
-            if "\n" in text:
-                return [json.loads(line) for line in text.splitlines() if line.strip().startswith("{")]
-            return None
-    except (requests.RequestException, ValueError, OSError):
-        return None
-
-
-def try_sources(product_id, isin):
-    """Try a few URLs for one contract. Returns (price, change_pct, high, low) or None."""
-    today = dt.datetime.utcnow().strftime("%Y%m%d")
-    candidates = [
-        # 1. The view-service's own JSON endpoint (same data mvs.deutsche-boerse.com displays).
-        f"{MVS_API}/instruments/XEUR/{product_id}/summary",
-        f"{MVS_API}/instruments/{isin}/XEUR/summary",
-        # 2. The file service, by product_id. The exact filename isn't documented, so
-        #    these are good-faith guesses — they'll silently fall through if wrong.
-        f"{MFS_BASE}/{today}/{product_id}.json.gz",
-        f"{MFS_BASE}/{product_id}/latest.json",
-        f"{MFS_BASE}/{product_id}.json",
-    ]
-    for url in candidates:
-        data = fetch_json(url)
-        if not data:
-            continue
-        # Normalise one of several possible shapes.
-        if isinstance(data, dict):
-            for key in ("summary", "trade", "lastTrade", "data"):
-                if isinstance(data.get(key), dict):
-                    data = data[key]
-                    break
-            price = num(data.get("lastPrice") or data.get("price") or data.get("last"))
-            prev = num(data.get("previousClose") or data.get("prevClose") or data.get("settlementPrice"))
-            hi = num(data.get("dayHigh") or data.get("high"))
-            lo = num(data.get("dayLow") or data.get("low"))
-            if price:
-                return price, (round((price / prev - 1) * 100, 3) if prev else None), hi, lo, url
-        elif isinstance(data, list) and data:
-            # Pick the most recent entry by timestamp.
-            try:
-                data.sort(key=lambda d: d.get("timestamp") or d.get("ts") or "")
-                last = data[-1]
-                price = num(last.get("price") or last.get("lastPrice"))
-                if price:
-                    return price, None, None, None, url
-            except (AttributeError, TypeError):
-                pass
+            r = requests.get(url, headers=UA, timeout=timeout)
+            return r.text if r.ok else None
+        except requests.RequestException as e:
+            log(f"  network error on {url}: {e}")
+            if attempt == retries - 1:
+                return None
+            time.sleep(2)
     return None
+
+
+def parse_quote(text):
+    """Returns {symbol, date, time, open, high, low, close, volume, name} or None."""
+    if not text:
+        return None
+    rows = list(csv.DictReader(io.StringIO(text)))
+    if not rows:
+        return None
+    row = rows[0]
+    close = num(row.get("Close"))
+    return None if close is None else {
+        "date": row.get("Date"), "time": row.get("Time"),
+        "open": num(row.get("Open")), "high": num(row.get("High")),
+        "low": num(row.get("Low")), "close": close,
+        "volume": num(row.get("Volume")), "name": row.get("Name"),
+    }
+
+
+def parse_history(text):
+    """Returns the daily close series as a list of (date, close), oldest first."""
+    if not text:
+        return []
+    out = []
+    for row in csv.DictReader(io.StringIO(text)):
+        c = num(row.get("Close"))
+        if c is not None and row.get("Date"):
+            out.append((row["Date"], c))
+    return out
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dry-run", action="store_true", help="Print what would be stored, don't write to Supabase.")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--fast", action="store_true",
+                    help="Price only — skip history for 52w high/low and 1-year return.")
+    ap.add_argument("--deadline", type=float, default=0,
+                    help="Seconds. Stop fetching after this long and save what we have, "
+                         "so the job finishes inside its runner timeout. 0 = no limit.")
     args = ap.parse_args()
+    started = time.monotonic()
+    out_of_time = lambda: args.deadline and (time.monotonic() - started) > args.deadline
 
     rows, misses = [], []
-    for pid, name, isin, region, cur in EUREX:
-        res = try_sources(pid, isin)
-        if not res:
-            misses.append(pid); log(f"  {pid}: no data from any endpoint"); continue
-        price, chpct, hi, lo, src = res
-        log(f"  {pid}: {price} ({chpct}%) from {src.rsplit('/', 2)[-1]}")
-        rows.append({
-            "symbol": pid,
+    for stooq_sym, name, group, cur, region in EUREX:
+        if out_of_time():
+            log(f"Deadline of {args.deadline:.0f}s reached — saving {len(rows)} contracts "
+                f"and leaving the rest for the next run.")
+            break
+        q = parse_quote(fetch_csv(QUOTE.format(sym=stooq_sym)))
+        if not q:
+            misses.append(stooq_sym); log(f"  {stooq_sym}: no quote"); continue
+        price = q["close"]
+
+        change_pct = hi52 = lo52 = y1 = None
+        if not args.fast:
+            hist = parse_history(fetch_csv(HISTORY.format(sym=stooq_sym)))
+            if hist:
+                # previous close = second-to-last row
+                if len(hist) >= 2 and hist[-2][1]:
+                    change_pct = round((price / hist[-2][1] - 1) * 100, 3)
+                closes = [c for _, c in hist[-260:]]  # ~1 trading year
+                if closes:
+                    hi52, lo52 = max(closes), min(closes)
+                    y1 = round((price / closes[0] - 1) * 100, 2) if len(closes) > 20 else None
+
+        # Eurex product code is the file name minus the .f, uppercased.
+        sym = stooq_sym.replace(".f", "").upper()
+        log(f"  {sym}: {price} {cur} ({change_pct if change_pct is not None else '?'}%)")
+        row = {
+            "symbol": sym,
             "name": name,
             "exchange": "EUREX",
             "region": region,
             "asset_class": "future",
             "currency": cur,
-            "sector": "Equity Index" if pid.startswith(("FS", "FE", "FD", "FM", "FT", "FX")) else "Rates",
-            "industry": "Equity Index" if pid.startswith(("FS", "FE", "FD", "FM", "FT", "FX")) else "Rates",
+            "sector": group,
+            "industry": group,
             "price": price,
-            "change_pct": chpct,
-            "high_52w": hi,
-            "low_52w": lo,
+            "change_pct": change_pct,
             "quote_updated_at": now_iso(),
-            "fundamentals_updated_at": now_iso(),
-        })
-        time.sleep(0.5)
+        }
+        if not args.fast:
+            row.update({"high_52w": hi52, "low_52w": lo52, "return_1y": y1,
+                        "fundamentals_updated_at": now_iso()})
+        rows.append(row)
+        time.sleep(0.25 if args.fast else 1.0)  # be polite to a free third-party service
 
-    log(f"Got {len(rows)} Eurex contracts, missed {len(misses)}: {misses}")
+    log(f"Got {len(rows)} Eurex contracts in {time.monotonic() - started:.0f}s, "
+        f"missed {len(misses)}: {misses}")
     if args.dry_run:
-        print(json.dumps(rows, indent=2))
-        return
+        import json; print(json.dumps(rows, indent=2)); return
     if rows:
         Supabase().upsert(rows)
         log(f"Stored {len(rows)} Eurex contracts.")
     else:
-        log("No Eurex data stored this run — the exact file-service URL couldn't be read. "
-            "The Yahoo index spot values (^SSMI, ^GDAXI, ^STOXX50E) from update_indices.py "
-            "cover the same underlyings.")
+        log("No Eurex data stored. Check whether any Stooq ticker changed by opening "
+            "https://stooq.com/q/?s=<ticker> in a browser.")
 
 
 if __name__ == "__main__":
