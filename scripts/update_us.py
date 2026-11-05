@@ -91,7 +91,8 @@ def main():
     # 1. The list of US stocks ------------------------------------------------
     listing = fh.get("/stock/symbol", exchange="US") or []
     stocks = {x["symbol"]: x for x in listing
-              if x.get("type") in TYPES and x.get("mic") in EXCHANGES and x.get("symbol")}
+              if x.get("type") in TYPES and x.get("mic") in EXCHANGES and x.get("symbol")
+              and not x["symbol"].endswith(".SW")}
     log(f"Finnhub lists {len(listing)} US symbols; {len(stocks)} are stocks on the main exchanges.")
     if len(stocks) < 2000:
         raise SystemExit("The symbol list looks incomplete, so nothing was changed. Try again later.")
@@ -100,24 +101,39 @@ def main():
     if args.limit:
         symbols = symbols[:args.limit]
 
-    existing = {r["symbol"] for r in db.select("symbol", {"region": "eq.US", "asset_class": "in.(stock,reit)"})}
-    new_rows = [{
-        "symbol": s,
-        "name": (stocks[s].get("description") or s).title(),
-        "exchange": EXCHANGES[stocks[s]["mic"]],
-        "region": "US",
-        "asset_class": asset_class_of(stocks[s].get("type"), None),
-        "currency": stocks[s].get("currency") or "USD",
-    } for s in symbols if s not in existing]
-    if new_rows:
-        db.upsert(new_rows)
-        log(f"Added {len(new_rows)} new stocks.")
+    # Housekeeping (adding newly listed stocks, dropping delisted ones) is wrapped
+    # in try/except so a Supabase blip here never blocks prices and fundamentals.
+    try:
+        # NB: include asset_class in the select so legacy rows with asset_class = NULL
+        # are also treated as existing — otherwise every nightly run would try to
+        # re-insert all 11k symbols as "new".
+        existing_rows = db.select("symbol,asset_class", {"region": "eq.US"})
+        existing = {r["symbol"] for r in existing_rows
+                    if r.get("asset_class") in (None, "stock", "reit")}
 
-    if not args.limit:
-        gone = existing - set(symbols)
-        if gone:
-            db.delete_symbols(gone)
-            log(f"Removed {len(gone)} stocks that are no longer listed.")
+        new_rows = [{
+            "symbol": s,
+            "name": (stocks[s].get("description") or s).title(),
+            "exchange": EXCHANGES[stocks[s]["mic"]],
+            "region": "US",
+            "asset_class": asset_class_of(stocks[s].get("type"), None),
+            "currency": stocks[s].get("currency") or "USD",
+        } for s in symbols if s not in existing]
+        if new_rows:
+            db.upsert(new_rows)
+            log(f"Added {len(new_rows)} new stocks.")
+
+        if not args.limit:
+            gone = existing - set(symbols)
+            if gone:
+                try:
+                    db.delete_symbols(gone)
+                    log(f"Removed {len(gone)} stocks that are no longer listed.")
+                except Exception as e:
+                    log(f"Delisting step failed ({len(gone)} to drop): {e}. Prices and "
+                        f"fundamentals continue; next run will retry the delete.")
+    except Exception as e:
+        log(f"Symbol-list housekeeping failed: {e}. Continuing to prices and fundamentals.")
 
     # 2. Prices ---------------------------------------------------------------
     log(f"Updating prices for {len(symbols)} stocks …")
