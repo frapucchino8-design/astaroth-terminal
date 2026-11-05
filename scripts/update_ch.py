@@ -111,12 +111,22 @@ def main():
     if args.limit:
         symbols = symbols[:args.limit]
 
-    rows, skipped, saved = [], 0, 0
+    builtin_syms = {s + ".SW" for s in BUILTIN}
+    rows, skipped, saved, dropped_foreign = [], 0, 0, 0
     for i, sym in enumerate(symbols, 1):
         info = fetch_info(sym)
         price = num(info.get("currentPrice") or info.get("regularMarketPrice"))
-        if not price or info.get("quoteType") not in (None, "EQUITY"):
+        # Must be an actual share, not an ETF, fund, right or warrant that the
+        # EBS screener also returns.
+        if not price or info.get("quoteType") != "EQUITY":
             skipped += 1
+            continue
+        # Must be a Swiss company. The EBS screener lists foreign secondary
+        # listings too, which is why non-Swiss names were showing up. Trust the
+        # built-in list; otherwise require Yahoo to say the country is Switzerland.
+        country = (info.get("country") or "").strip()
+        if sym not in builtin_syms and country and country != "Switzerland":
+            dropped_foreign += 1
             continue
         cur = info.get("currency") or "CHF"
         prev = num(info.get("regularMarketPreviousClose") or info.get("previousClose"))
@@ -164,7 +174,7 @@ def main():
     if rows:
         db.upsert(rows)
     total = saved + len(rows)
-    log(f"Updated {total} Swiss stocks, skipped {skipped} without data.")
+    log(f"Updated {total} Swiss stocks, skipped {skipped} without data, dropped {dropped_foreign} foreign listings.")
 
     if complete_list and not args.limit and total >= 100:
         existing = {r["symbol"] for r in db.select(
