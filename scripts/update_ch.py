@@ -113,6 +113,7 @@ def main():
 
     builtin_syms = {s + ".SW" for s in BUILTIN}
     rows, skipped, saved, dropped_foreign = [], 0, 0, 0
+    kept_syms = set()   # only the genuine Swiss equities we actually stored
     for i, sym in enumerate(symbols, 1):
         info = fetch_info(sym)
         price = num(info.get("currentPrice") or info.get("regularMarketPrice"))
@@ -163,6 +164,7 @@ def main():
             "quote_updated_at": now_iso(),
             "fundamentals_updated_at": now_iso(),
         })
+        kept_syms.add(sym)
         if i % 25 == 0:
             log(f"  {i}/{len(symbols)}")
         if len(rows) >= 50:
@@ -176,13 +178,17 @@ def main():
     total = saved + len(rows)
     log(f"Updated {total} Swiss stocks, skipped {skipped} without data, dropped {dropped_foreign} foreign listings.")
 
-    if complete_list and not args.limit and total >= 100:
+    # Prune the Switzerland table down to exactly what we kept. This is what
+    # clears out the foreign secondary listings and funds that had bloated the
+    # count — they're skipped above, so they fall into `gone` here and go.
+    # Guarded by total >= 100 so a bad Yahoo run never empties the table.
+    if not args.limit and total >= 100:
         existing = {r["symbol"] for r in db.select(
             "symbol", {"region": "eq.Switzerland", "asset_class": "in.(stock,reit)"})}
-        gone = existing - set(symbols)
+        gone = existing - kept_syms
         if gone:
             db.delete_symbols(gone)
-            log(f"Removed {len(gone)} Swiss stocks that are no longer listed.")
+            log(f"Removed {len(gone)} Swiss rows that are foreign, funds, or no longer listed.")
 
 
 if __name__ == "__main__":
