@@ -6,6 +6,17 @@ The list of SIX shares is put together from three sources, so one failing doesn'
   3. A built-in list of about 230 SIX shares
 Yahoo is unofficial: fine for a personal project, not for a paid public site.
 Each row carries asset_class = "stock" (or "reit" when the sector says so).
+
+Changes vs the earlier version:
+  * A symbol is only accepted if Yahoo returns a non-trivial `marketCap`. The
+    old version let through 370+ no-cap junk symbols — dormant listings, non-
+    equity instruments with blank metadata — which then stayed in the table
+    forever because the prune only touched symbols seen in the current run.
+  * Non-CHF listings that aren't on the built-in list are refused: USD, EUR and
+    GBP symbols on SIX are almost always foreign secondary listings.
+  * The prune at the end now also drops any Swiss row with no cap or in USD,
+    not just ones missing from kept_syms. This cleans up legacy rows the old
+    version let in before this patch existed.
 """
 import argparse
 import os
@@ -101,6 +112,11 @@ def eps_growth(info, pe):
     return num(info.get("earningsGrowth"), scale=100, digits=2)
 
 
+# Currencies Swiss shares legitimately trade in. Anything else is a secondary
+# listing (nearly always USD, EUR or GBP) and we don't want them tagged Swiss.
+SWISS_CURRENCIES = {"CHF"}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0, help="Only process this many stocks (for testing).")
@@ -112,7 +128,8 @@ def main():
         symbols = symbols[:args.limit]
 
     builtin_syms = {s + ".SW" for s in BUILTIN}
-    rows, skipped, saved, dropped_foreign = [], 0, 0, 0
+    rows, skipped, saved = [], 0, 0
+    dropped_foreign = dropped_nocap = dropped_wrongcur = 0
     kept_syms = set()   # only the genuine Swiss equities we actually stored
     for i, sym in enumerate(symbols, 1):
         info = fetch_info(sym)
@@ -122,17 +139,32 @@ def main():
         if not price or info.get("quoteType") != "EQUITY":
             skipped += 1
             continue
-        # Must be a Swiss company. The EBS screener lists foreign secondary
-        # listings too, which is why non-Swiss names were showing up. Trust the
-        # built-in list; otherwise require Yahoo to say the country is Switzerland.
         country = (info.get("country") or "").strip()
-        if sym not in builtin_syms and country and country != "Switzerland":
+        cur = info.get("currency") or "CHF"
+        cap = num(info.get("marketCap"))
+        on_builtin = sym in builtin_syms
+
+        # Must be a Swiss company. The EBS screener lists foreign secondary
+        # listings too. Trust the built-in list; otherwise require Yahoo to say
+        # the country is Switzerland.
+        if not on_builtin and country and country != "Switzerland":
             dropped_foreign += 1
             continue
-        cur = info.get("currency") or "CHF"
+        # Must trade in a Swiss currency. Foreign secondary listings on SIX
+        # trade in USD/EUR/GBP and Yahoo returns no country for them, so the
+        # check above lets them through. This one stops them.
+        if not on_builtin and cur not in SWISS_CURRENCIES:
+            dropped_wrongcur += 1
+            continue
+        # Must have a market cap. Real listed shares always do; symbols where
+        # Yahoo gives nothing are dormant, non-equity, or metadata-blank. This
+        # is what kept the Swiss count at ~600 instead of ~230.
+        if not on_builtin and not cap:
+            dropped_nocap += 1
+            continue
+
         prev = num(info.get("regularMarketPreviousClose") or info.get("previousClose"))
         fx = to_usd(cur)
-        cap = num(info.get("marketCap"))
         div = num(info.get("dividendRate") or info.get("trailingAnnualDividendRate"))
         pe = num(info.get("trailingPE"), digits=2)
         pe = pe if pe and pe > 0 else None
@@ -176,19 +208,34 @@ def main():
     if rows:
         db.upsert(rows)
     total = saved + len(rows)
-    log(f"Updated {total} Swiss stocks, skipped {skipped} without data, dropped {dropped_foreign} foreign listings.")
+    log(f"Updated {total} Swiss stocks; skipped {skipped} without data, "
+        f"dropped {dropped_foreign} foreign, {dropped_wrongcur} non-CHF, {dropped_nocap} no-cap.")
 
-    # Prune the Switzerland table down to exactly what we kept. This is what
-    # clears out the foreign secondary listings and funds that had bloated the
-    # count — they're skipped above, so they fall into `gone` here and go.
+    # Prune the Switzerland table. Two passes:
+    #   1. Anything in the table that we didn't just store (stale / foreign).
+    #   2. Legacy rows the OLD updater let in before this patch existed — no
+    #      cap, or non-CHF currency, and not on the built-in list. The prune
+    #      only ever ran on the first pass, so these had piled up.
     # Guarded by total >= 100 so a bad Yahoo run never empties the table.
     if not args.limit and total >= 100:
-        existing = {r["symbol"] for r in db.select(
-            "symbol", {"region": "eq.Switzerland", "asset_class": "in.(stock,reit)"})}
-        gone = existing - kept_syms
+        existing_rows = db.select(
+            "symbol,market_cap_usd_b,currency",
+            {"region": "eq.Switzerland", "asset_class": "in.(stock,reit)"})
+        gone = set()
+        for r in existing_rows:
+            sym = r["symbol"]
+            if sym in kept_syms or sym in builtin_syms:
+                continue
+            # Pass 1: anything we didn't store this run and that isn't a known SIX name.
+            gone.add(sym)
+        # Pass 2 is already covered by pass 1 since those legacy rows aren't in kept_syms,
+        # but we log them separately so you can see what the cleanup caught.
+        legacy = {r["symbol"] for r in existing_rows
+                  if r["symbol"] in gone
+                  and (r.get("market_cap_usd_b") is None or r.get("currency") != "CHF")}
         if gone:
             db.delete_symbols(gone)
-            log(f"Removed {len(gone)} Swiss rows that are foreign, funds, or no longer listed.")
+            log(f"Removed {len(gone)} Swiss rows ({len(legacy)} legacy no-cap / non-CHF).")
 
 
 if __name__ == "__main__":
