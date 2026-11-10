@@ -138,13 +138,24 @@ def main():
             "would then wipe every crypto row. Try again in a few minutes.")
 
     # 4) Shape the rows.
-    rows_batch, kept, skipped = [], set(), 0
+    #
+    # CoinGecko occasionally returns two different coins that share a symbol
+    # (SOL, BNB, HYPE and so on — one famous, one a tiny imitator). Building
+    # a ticker as SYMBOL-USD would then put two rows with the same primary key
+    # into the same upsert batch, and Postgres refuses with:
+    #   "ON CONFLICT DO UPDATE command cannot affect row a second time"
+    # CoinGecko returns coins ordered by market cap, so keeping only the first
+    # time we see a symbol keeps the one you've actually heard of.
+    rows_batch, kept, skipped, deduped = [], set(), 0, 0
     for c in all_coins[:args.top]:
         sym = (c.get("symbol") or "").upper()
         if not sym:
             skipped += 1
             continue
         ticker = f"{sym}-USD"
+        if ticker in kept:
+            deduped += 1
+            continue
         price = num(c.get("current_price"))
         if not price:
             skipped += 1
@@ -186,7 +197,7 @@ def main():
     if rows_batch:
         upsert(db, rows_batch, args.no_extras)
 
-    log(f"Updated {len(kept)} crypto rows (skipped {skipped}).")
+    log(f"Updated {len(kept)} crypto rows (skipped {skipped}, dropped {deduped} duplicate-symbol imitators).")
 
     # 5) Remove coins that have fallen out of the top list. Guarded by the
     # MIN_COINS check above — we only reach here with a healthy batch.
