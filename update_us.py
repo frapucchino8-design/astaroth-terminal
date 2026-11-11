@@ -8,6 +8,9 @@
 
 The free plan allows about 60 calls a minute, so this stays at roughly 54.
 Each row carries asset_class = "stock" or "reit".
+
+A stock is removed only when Finnhub has stopped listing the symbol entirely,
+and never more than 2% of the table in one run. See the delete step in main().
 """
 import argparse
 import time
@@ -25,6 +28,11 @@ EXCHANGES = {
     "BATS": "Cboe BZX",
 }
 TYPES = {"Common Stock", "ADR", "REIT"}
+
+# Delisting rails. A real night of delistings is a handful of symbols; these
+# stop a bad listing from emptying the table. See the delete step in main().
+MAX_DROP_FRACTION = 0.02        # at most 2% of the US rows in one run
+MIN_DROP_ALLOWED = 50           # ... but always allow a small clear-out
 
 
 def asset_class_of(type_, industry):
@@ -82,20 +90,60 @@ def main():
     ap.add_argument("--budget-minutes", type=float, default=300,
                     help="Stop starting new work after this many minutes.")
     ap.add_argument("--limit", type=int, default=0, help="Only process this many stocks (for testing).")
+    ap.add_argument("--no-delete", action="store_true",
+                    help="Never remove anything, whatever the listing says.")
+    ap.add_argument("--check", action="store_true",
+                    help="Print what Finnhub's listing looks like and stop. Touches nothing.")
     args = ap.parse_args()
     deadline = time.monotonic() + args.budget_minutes * 60
 
     fh = Finnhub(env("FINNHUB_API_KEY"))
-    db = Supabase()
+    db = None if args.check else Supabase()
 
     # 1. The list of US stocks ------------------------------------------------
     listing = fh.get("/stock/symbol", exchange="US") or []
+    # Every symbol Finnhub still lists, whatever it calls it. THIS is the set
+    # that decides whether something has been delisted — see the delete below.
+    listed_all = {x.get("symbol") for x in listing if x.get("symbol")}
     stocks = {x["symbol"]: x for x in listing
               if x.get("type") in TYPES and x.get("mic") in EXCHANGES and x.get("symbol")
               and not x["symbol"].endswith(".SW")}
     log(f"Finnhub lists {len(listing)} US symbols; {len(stocks)} are stocks on the main exchanges.")
-    if len(stocks) < 2000:
-        raise SystemExit("The symbol list looks incomplete, so nothing was changed. Try again later.")
+    types_seen = {}
+    for x in listing:
+        types_seen[x.get("type") or "(blank)"] = types_seen.get(x.get("type") or "(blank)", 0) + 1
+    log("  listing types: " + ", ".join(f"{k}={v}" for k, v in
+                                        sorted(types_seen.items(), key=lambda kv: -kv[1])[:8]))
+    if args.check:
+        mics = {}
+        for x in listing:
+            mics[x.get("mic") or "(blank)"] = mics.get(x.get("mic") or "(blank)", 0) + 1
+        log("")
+        log("Exchanges (MIC) in the listing, most common first:")
+        for k, v in sorted(mics.items(), key=lambda kv: -kv[1])[:15]:
+            log(f"    {k:<10} {v:>7}   {'KEPT as ' + EXCHANGES[k] if k in EXCHANGES else 'ignored'}")
+        log("")
+        log("Types in the listing, most common first:")
+        for k, v in sorted(types_seen.items(), key=lambda kv: -kv[1])[:15]:
+            log(f"    {k:<24} {v:>7}   {'KEPT' if k in TYPES else 'ignored'}")
+        log("")
+        log("A few well-known symbols, exactly as Finnhub describes them:")
+        by_sym = {x.get("symbol"): x for x in listing}
+        for sym in ("AAPL", "MSFT", "JPM", "KO", "O", "PLD", "BRK.B", "F", "T"):
+            x = by_sym.get(sym)
+            log(f"    {sym:<8} " + (f"type={x.get('type')!r:<18} mic={x.get('mic')!r}" if x else "NOT IN THE LISTING AT ALL"))
+        log("")
+        log(f"VERDICT: {len(listing)} listed, {len(stocks)} pass the type/exchange filter.")
+        log("  About 10,000 passing  -> the listing is healthy; a normal run restores the missing rows.")
+        log("  Far fewer than that   -> the type or MIC labels above have changed; TYPES / EXCHANGES")
+        log("                           at the top of this file need the new spelling.")
+        return
+
+    if len(listing) < 5000 or len(stocks) < 5000:
+        raise SystemExit(
+            f"The symbol list looks incomplete ({len(listing)} listed, {len(stocks)} usable; "
+            "expected roughly 11,000 and 10,000). Nothing was changed — try again later. "
+            "If the types above have changed names, TYPES at the top of this file needs updating.")
 
     symbols = sorted(stocks)
     if args.limit:
@@ -122,13 +170,45 @@ def main():
         if new_rows:
             db.upsert(new_rows)
             log(f"Added {len(new_rows)} new stocks.")
+            # A row with no price is invisible on the website, so price the
+            # new ones first. After a big restore that is the difference
+            # between seeing them tonight and seeing them in three days.
+            fresh = {r["symbol"] for r in new_rows}
+            symbols = [s2 for s2 in symbols if s2 in fresh] + [s2 for s2 in symbols if s2 not in fresh]
 
-        if not args.limit:
-            gone = existing - set(symbols)
+        # ------------------------------------------------------------------
+        # Delisting. Two rails, because this step once deleted about 5,000
+        # live stocks in a single run:
+        #
+        #   1. A row goes only when Finnhub has stopped listing the symbol
+        #      ALTOGETHER. It used to go whenever it failed the type/exchange
+        #      filter above — so the day Finnhub relabelled a type or moved a
+        #      venue's MIC, every affected stock was deleted even though it was
+        #      still trading and still in the listing.
+        #   2. Never more than MAX_DROP_FRACTION of the table in one run. A
+        #      real night of delistings is a handful of symbols; anything
+        #      bigger is the data source misbehaving, so it stops and says so.
+        # ------------------------------------------------------------------
+        gone = existing - listed_all
+        if args.limit or args.no_delete:
             if gone:
+                log(f"Not deleting anything this run ({len(gone)} would have gone).")
+        elif gone:
+            cap = max(MIN_DROP_ALLOWED, int(len(existing) * MAX_DROP_FRACTION))
+            if len(gone) > cap:
+                log("")
+                log("=" * 68)
+                log(f"REFUSING TO DELETE: {len(gone)} of {len(existing)} US rows are missing "
+                    f"from Finnhub's listing (the limit for one run is {cap}).")
+                log("That is almost always a bad listing, not thousands of delistings overnight.")
+                log(f"A few of them: {', '.join(sorted(gone)[:20])}")
+                log("Nothing was deleted. Prices and fundamentals continue as normal.")
+                log("=" * 68)
+            else:
                 try:
                     db.delete_symbols(gone)
-                    log(f"Removed {len(gone)} stocks that are no longer listed.")
+                    log(f"Removed {len(gone)} stocks that are no longer listed: "
+                        f"{', '.join(sorted(gone)[:20])}{' …' if len(gone) > 20 else ''}")
                 except Exception as e:
                     log(f"Delisting step failed ({len(gone)} to drop): {e}. Prices and "
                         f"fundamentals continue; next run will retry the delete.")
