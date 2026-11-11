@@ -3,6 +3,8 @@ name: Update price history
 # Weekly closes going back twenty years, for the indices, everything in a vault
 # or portfolio, and the 200 largest instruments. The first run loads the full
 # history (a few minutes); after that each run only adds the latest weeks.
+#
+# Needs supabase/migration_history.sql to have been run once.
 on:
   schedule:
     - cron: "41 07 * * 6"       # Saturday 07:41 UTC, after the week has closed
@@ -14,8 +16,8 @@ on:
         default: false
 
 concurrency:
-  group: history-${{ github.ref }}
-  cancel-in-progress: true
+  group: history
+  cancel-in-progress: false
 
 jobs:
   update:
@@ -23,18 +25,14 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install -r scripts/requirements.txt
       - name: Update price history
+        run: python scripts/update_history.py --deadline 2100 ${{ inputs.full && '--full' || '' }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: python update_history.py --deadline 2100 ${{ inputs.full && '--full' || '' }}
