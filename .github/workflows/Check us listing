@@ -1,0 +1,31 @@
+name: Check the US listing
+
+# Read-only. Asks Finnhub for the US symbol list and prints what it looks like:
+# how many symbols, which exchange codes and type labels it uses, and whether a
+# few well-known stocks are in there. It never reads or writes the database.
+#
+# Run this from the Actions tab before a restore, to see whether the listing is
+# healthy or whether Finnhub has renamed its type or exchange labels.
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Look at the listing
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+        run: python update_us.py --check
