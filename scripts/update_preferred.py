@@ -26,6 +26,7 @@ and callable.
 Needs SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY, like the other scripts.
 """
 import argparse
+import logging
 import re
 import time
 
@@ -133,6 +134,11 @@ def main():
     except ImportError:
         raise SystemExit("yfinance isn't installed. pip install -r scripts/requirements.txt")
 
+    # yfinance prints its own "HTTP Error 404" line for every ticker Yahoo has
+    # never heard of, which buries the real output. They are counted and listed
+    # at the end instead, so the list below can be pruned.
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
     started = time.monotonic()
     out_of_time = lambda: args.deadline and (time.monotonic() - started) > args.deadline
 
@@ -140,7 +146,7 @@ def main():
     log(f"Checking {len(tickers)} preferred issues.")
 
     db = None if args.dry_run else Supabase()
-    rows, kept, skipped = [], set(), 0
+    rows, kept, skipped, missing = [], set(), 0, []
 
     for i, sym in enumerate(tickers, 1):
         if out_of_time():
@@ -150,6 +156,7 @@ def main():
             info = yf.Ticker(sym).info or {}
         except Exception as e:
             skipped += 1
+            missing.append(sym)
             log(f"  {sym}: {str(e)[:50]}")
             time.sleep(args.sleep)
             continue
@@ -157,6 +164,7 @@ def main():
         price = num(info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose"))
         if not price:
             skipped += 1
+            missing.append(sym)
             time.sleep(args.sleep)
             continue
 
@@ -212,6 +220,10 @@ def main():
         db.upsert(rows)
 
     log(f"{'Would write' if args.dry_run else 'Wrote'} {len(kept)} preferred issues, skipped {skipped}.")
+    if missing:
+        log(f"Yahoo had no quote for {len(missing)} of them — these have been called, renamed or "
+            f"never existed, and can be taken out of TICKERS at the top of this file:")
+        log("    " + " ".join(sorted(missing)))
 
     # Clear out issues that have been called or delisted, but only on a full run.
     if not args.dry_run and not args.limit and not args.deadline and len(kept) > 30:
