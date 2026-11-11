@@ -1,0 +1,35 @@
+name: Update preferred shares
+
+# Nothing was running scripts/update_preferred.py, which is why the database has
+# no preferred rows and the Preferred chip in Search comes up empty.
+#
+# Preferred shares don't need daily updates — the price barely moves and the
+# figures that matter (coupon, par) never change. Saturday morning is plenty.
+on:
+  schedule:
+    - cron: "33 06 * * 6"       # Saturday 06:33 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: preferred
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    # ~110 tickers at ~1s each plus yfinance overhead; capped so a stall can't
+    # burn an hour of runner time.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install -r scripts/requirements.txt
+      - name: Update preferred shares
+        run: python scripts/update_preferred.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
