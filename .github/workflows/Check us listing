@@ -15,17 +15,13 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install -r scripts/requirements.txt
       - name: Look at the listing
+        run: python scripts/update_us.py --check
         env:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
-        run: python update_us.py --check
