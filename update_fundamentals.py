@@ -1,8 +1,9 @@
 """Fill in the extra fundamentals the new screeners use.
 
 Covers free cash flow per share, revenue per share, shares outstanding, ROIC,
-receivable days, debt/assets, cash and cash as a share of assets, five-year
-dividend growth, and earnings growth over three, five and ten years.
+receivable days, debt/assets, cash and cash as a share of assets, dividend
+growth over one, three, five and ten years, the dividend streak (years of
+raises in a row), and earnings growth over three, five and ten years.
 
 Everything comes from Yahoo through yfinance: `info` for the headline figures,
 and the yearly balance sheet / income statement / dividend history for the ones
@@ -14,17 +15,23 @@ built to run in slices and pick up where it stopped:
     python update_fundamentals.py --stale-days 30 --deadline 18000
 
 Run supabase/migration_fundamentals.sql first, or every write will fail on a
-missing column.
+missing column. The dividend windows and the streak also need
+supabase/migration_dividends.sql; until that has been run they are skipped
+(with a note in the log) and everything else is written as before.
 
 Needs SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY, like the other scripts.
 """
 import argparse
+import datetime as _dt
 import math
 import time
 
 from common import Supabase, log, now_iso, num, to_usd
 
 TAX = 0.21   # assumed cash tax rate for the ROIC numerator
+
+# Columns added by migration_dividends.sql.
+DIVIDEND_EXTRA_COLS = ("dividend_growth_1y", "dividend_growth_3y", "dividend_growth_10y", "dividend_streak_years")
 
 
 def cagr(new, old, years):
@@ -113,14 +120,18 @@ def eps_growth_windows(tk):
     return out
 
 
-def dividend_growth_5y(tk):
-    """Five-year growth in dividends per share, from the payment history."""
+def dividends_by_year(tk):
+    """Dividends per share summed by calendar year, complete years only.
+
+    The current year is left out because it is usually unfinished, which would
+    make every company look like it had just cut its dividend.
+    """
     try:
         divs = tk.dividends
     except Exception:
-        return None
+        return {}
     if divs is None or len(divs) == 0:
-        return None
+        return {}
     by_year = {}
     for ts, amount in divs.items():
         try:
@@ -128,13 +139,13 @@ def dividend_growth_5y(tk):
             by_year[ts.year] += float(amount)
         except (TypeError, ValueError, AttributeError):
             continue
-    years = sorted(by_year)
-    if len(years) < 3:
-        return None
-    # ignore the current year, which is usually incomplete
-    import datetime as _dt
     this_year = _dt.date.today().year
-    years = [y for y in years if y < this_year]
+    return {y: v for y, v in by_year.items() if y < this_year and v > 0}
+
+
+def dividend_growth_5y(by_year):
+    """Five-year growth in dividends per share, from the yearly totals."""
+    years = sorted(by_year)
     if len(years) < 3:
         return None
     newest = years[-1]
@@ -143,6 +154,55 @@ def dividend_growth_5y(tk):
         target = years[:1]
     oldest = min(target)
     return cagr(by_year[newest], by_year[oldest], newest - oldest)
+
+
+def dividend_extras(by_year):
+    """Dividend growth over 1, 3 and 10 years, and the streak of raises.
+
+    Only for companies that paid in the last full calendar year: growth to a
+    payment that stopped years ago says nothing about today.
+
+    The streak counts back from the last full year for as long as each year's
+    total was higher than the year before. A flat or lower year ends it, and so
+    does a gap in the record. 0 means "pays, but did not raise last year".
+    """
+    out = {}
+    if not by_year:
+        return out
+    last_full = _dt.date.today().year - 1
+    newest = max(by_year)
+    if newest < last_full:
+        # Paid in the past, nothing last year: the streak is over.
+        out["dividend_streak_years"] = 0
+        return out
+
+    # 1 and 3 years use exactly that span. 10 years accepts 8-10, the same
+    # leniency the 5-year figure has, so a nine-year record still gets a number.
+    for window, lo, key in ((1, 1, "dividend_growth_1y"), (3, 3, "dividend_growth_3y"), (10, 8, "dividend_growth_10y")):
+        spans = [newest - y for y in by_year if lo <= newest - y <= window]
+        if not spans:
+            continue
+        span = max(spans)
+        g = cagr(by_year[newest], by_year[newest - span], span)
+        if g is not None:
+            out[key] = g
+
+    streak, year = 0, newest
+    # the 0.1% tolerance keeps rounding in the payment history from counting as a raise
+    while (year - 1) in by_year and by_year[year] > by_year[year - 1] * 1.001:
+        streak += 1
+        year -= 1
+    out["dividend_streak_years"] = streak
+    return out
+
+
+def has_dividend_columns(db):
+    """True once migration_dividends.sql has been run."""
+    try:
+        r = db.s.get(f"{db.url}/stocks", params={"select": ",".join(DIVIDEND_EXTRA_COLS), "limit": "1"}, timeout=30)
+        return r.status_code < 300
+    except Exception:
+        return False
 
 
 def balance_sheet_metrics(tk, info, price, currency):
@@ -247,7 +307,6 @@ def main():
             if not ts:
                 return True
             try:
-                import datetime as _dt
                 return _dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() < cutoff
             except (ValueError, AttributeError):
                 return True
@@ -258,6 +317,14 @@ def main():
     log(f"{len(rows)} instruments to update.")
     if not rows:
         return
+
+    # The 1/3/10-year dividend windows and the streak live in columns added by
+    # migration_dividends.sql. Writing them before it has run would fail the
+    # whole batch, so check once and leave them out if they aren't there yet.
+    write_div_extras = has_dividend_columns(db)
+    if not write_div_extras:
+        log("  dividend_growth_1y/3y/10y and dividend_streak_years aren't in the database yet — "
+            "run supabase/migration_dividends.sql to fill the Dividend screeners. Skipping them this run.")
 
     batch, saved, skipped = [], 0, 0
     for i, row in enumerate(rows, 1):
@@ -285,9 +352,12 @@ def main():
         rec.update(bs)
         rec.update(per_share(info, revenue, shares))
         rec.update(eps_growth_windows(tk))
-        dg = dividend_growth_5y(tk)
+        by_year = dividends_by_year(tk)
+        dg = dividend_growth_5y(by_year)
         if dg is not None:
             rec["dividend_growth_5y"] = dg
+        if write_div_extras:
+            rec.update(dividend_extras(by_year))
         rec["fundamentals_updated_at"] = now_iso()
 
         # Only write if we actually learned something beyond the keys we always set.
@@ -312,4 +382,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()# update_fundamentals.py — paste contents from Claude chat here
+    main()
