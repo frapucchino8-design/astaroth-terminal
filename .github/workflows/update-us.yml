@@ -1,0 +1,61 @@
+name: Update US stocks
+
+# Every four hours, around the clock.
+#
+# update_us.py refreshes prices for the whole US list and then fundamentals
+# (P/E, margins, sector, growth) oldest-first, so a run that hits its time
+# budget stops cleanly and the next one carries on where it stopped. Nothing
+# here needs pressing by hand.
+#
+# Finnhub's free plan allows about 60 calls a minute, which is what makes this
+# slow rather than the runner: roughly two hours for 6,000 prices and then as
+# much of the fundamentals list as the budget allows. The budget is 200 minutes
+# so a run always finishes before the next one is due.
+#
+# The delisting check (dropping symbols Finnhub no longer lists) only runs on
+# the 22:13 UTC run. Doing it six times a day would be six full listing
+# downloads for something that changes once a day at most.
+on:
+  schedule:
+    - cron: "13 2,6,10,14,18 * * *"   # the five intraday runs: fundamentals only housekeeping-wise
+    - cron: "13 22 * * *"             # the evening run, which also tidies delistings
+  workflow_dispatch:
+    inputs:
+      budget:
+        description: "Minutes of work before stopping (the next run continues)"
+        default: "200"
+      housekeeping:
+        description: "Also remove symbols Finnhub no longer lists"
+        type: boolean
+        default: true
+
+# Queue, never overlap: a slice that is still running keeps the Finnhub key to
+# itself, and the next run starts when it is done.
+concurrency:
+  group: update-us
+  cancel-in-progress: false
+
+jobs:
+  us:
+    runs-on: ubuntu-latest
+    timeout-minutes: 230
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install -r scripts/requirements.txt
+      - name: Update US stocks (Finnhub)
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # Skip the delisting check on the intraday runs; the 22:13 one does the full job.
+          SKIP_DELETE: ${{ (github.event_name == 'schedule' && github.event.schedule != '13 22 * * *') || (github.event_name == 'workflow_dispatch' && inputs.housekeeping == false) }}
+          BUDGET: ${{ inputs.budget || '200' }}
+        run: |
+          EXTRA=""
+          if [ "$SKIP_DELETE" = "true" ]; then EXTRA="--no-delete"; fi
+          python scripts/update_us.py --budget-minutes "$BUDGET" $EXTRA
