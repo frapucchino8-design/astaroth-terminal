@@ -1,0 +1,144 @@
+name: Update other markets
+
+# Everything that isn't a US stock, once an hour: Swiss shares, ETFs, futures,
+# Eurex, indices, crypto and FX. These all come from Yahoo or the exchange
+# itself rather than Finnhub, so they are quick and have no shared rate limit —
+# the jobs run side by side and a whole round takes well under the hour.
+#
+# ETFs are the only long list (a couple of thousand). update_etfs.py works
+# oldest-first and stops at its deadline, so each hourly run advances the list
+# and a full pass comes round every few hours.
+#
+# Eurex is best-effort: the Deutsche Börse file service is often unreachable,
+# and a failure there shouldn't colour the whole run red.
+on:
+  schedule:
+    - cron: "41 * * * *"
+  workflow_dispatch:
+    inputs:
+      market:
+        description: "Which one to update"
+        type: choice
+        options: [all, switzerland, etfs, futures, indices, crypto, fx, eurex]
+        default: all
+
+# An hourly schedule can't be allowed to pile up. If the previous round is
+# somehow still going, drop it and take the fresher one — every script here
+# saves as it goes and picks up where it left off.
+concurrency:
+  group: update-markets
+  cancel-in-progress: true
+
+env:
+  FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  switzerland:
+    if: ${{ github.event_name == 'schedule' || inputs.market == 'all' || inputs.market == 'switzerland' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install -r scripts/requirements.txt
+      - run: python scripts/update_ch.py
+
+  etfs:
+    if: ${{ github.event_name == 'schedule' || inputs.market == 'all' || inputs.market == 'etfs' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install -r scripts/requirements.txt
+      # 25 minutes a run, so it is always done before the next hour.
+      - run: python scripts/update_etfs.py --deadline 1500
+
+  futures:
+    if: ${{ github.event_name == 'schedule' || inputs.market == 'all' || inputs.market == 'futures' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install -r scripts/requirements.txt
+      - run: python scripts/update_futures.py
+
+  indices:
+    if: ${{ github.event_name == 'schedule' || inputs.market == 'all' || inputs.market == 'indices' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install -r scripts/requirements.txt
+      - run: python scripts/update_indices.py
+
+  crypto:
+    if: ${{ github.event_name == 'schedule' || inputs.market == 'all' || inputs.market == 'crypto' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install -r scripts/requirements.txt
+      - run: python scripts/update_crypto.py
+
+  fx:
+    if: ${{ github.event_name == 'schedule' || inputs.market == 'all' || inputs.market == 'fx' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install -r scripts/requirements.txt
+      - name: FX rates
+        # --fast is rates only. The per-currency year history is one request per
+        # currency with a polite pause between, so it runs once a day, at 06:41 UTC.
+        run: |
+          if [ "$(date -u +%H)" = "06" ]; then
+            python scripts/update_fx.py
+          else
+            python scripts/update_fx.py --fast
+          fi
+
+  eurex:
+    if: ${{ github.event_name == 'schedule' || inputs.market == 'all' || inputs.market == 'eurex' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true   # best-effort: the Deutsche Börse file service may not be reachable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install -r scripts/requirements.txt
+      - run: python scripts/update_eurex.py
