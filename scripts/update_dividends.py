@@ -25,6 +25,7 @@ a missing column, and the script says so and stops.
 Needs SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY, like the other scripts.
 """
 import argparse
+import datetime as dt
 import sys
 import threading
 import time
@@ -32,13 +33,103 @@ from concurrent.futures import ThreadPoolExecutor
 
 from common import Supabase, log, now_iso
 
-try:
-    from update_fundamentals import dividends_by_year, dividend_growth_5y, dividend_extras
-except ImportError:
-    sys.exit("update_fundamentals.py must sit next to this script — it holds the dividend maths.")
-
 COLUMNS = ("dividend_growth_1y", "dividend_growth_3y", "dividend_growth_5y",
            "dividend_growth_10y", "dividend_streak_years")
+
+
+# ---------------------------------------------------------------------------
+# The dividend maths. update_fundamentals.py has its own copy of this, so this
+# script needs nothing but common.py to run.
+# ---------------------------------------------------------------------------
+def cagr(new, old, years):
+    """Compound annual growth, in percent. None when it can't be computed."""
+    try:
+        new, old, years = float(new), float(old), float(years)
+    except (TypeError, ValueError):
+        return None
+    if years <= 0 or old <= 0 or new <= 0:
+        return None
+    try:
+        return round(((new / old) ** (1 / years) - 1) * 100, 2)
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return None
+
+
+def dividends_by_year(tk):
+    """Dividends per share summed by calendar year, complete years only.
+
+    The current year is left out because it is usually unfinished, which would
+    make every company look like it had just cut its dividend.
+    """
+    try:
+        divs = tk.dividends
+    except Exception:
+        return {}
+    if divs is None or len(divs) == 0:
+        return {}
+    by_year = {}
+    for ts, amount in divs.items():
+        try:
+            by_year.setdefault(ts.year, 0.0)
+            by_year[ts.year] += float(amount)
+        except (TypeError, ValueError, AttributeError):
+            continue
+    this_year = dt.date.today().year
+    return {y: v for y, v in by_year.items() if y < this_year and v > 0}
+
+
+def dividend_growth_5y(by_year):
+    """Five-year growth in dividends per share, from the yearly totals."""
+    years = sorted(by_year)
+    if len(years) < 3:
+        return None
+    newest = years[-1]
+    target = [y for y in years if 3 <= newest - y <= 5]
+    if not target:
+        target = years[:1]
+    oldest = min(target)
+    return cagr(by_year[newest], by_year[oldest], newest - oldest)
+
+
+def dividend_extras(by_year):
+    """Dividend growth over 1, 3 and 10 years, and the streak of raises.
+
+    Only for companies that paid in the last full calendar year: growth to a
+    payment that stopped years ago says nothing about today.
+
+    The streak counts back from the last full year for as long as each year's
+    total was higher than the year before. A flat or lower year ends it, and so
+    does a gap in the record. 0 means "pays, but did not raise last year".
+    """
+    out = {}
+    if not by_year:
+        return out
+    last_full = dt.date.today().year - 1
+    newest = max(by_year)
+    if newest < last_full:
+        # Paid in the past, nothing last year: the streak is over.
+        out["dividend_streak_years"] = 0
+        return out
+
+    # 1 and 3 years use exactly that span. 10 years accepts 8-10, the same
+    # leniency the 5-year figure has, so a nine-year record still gets a number.
+    for window, lo, key in ((1, 1, "dividend_growth_1y"), (3, 3, "dividend_growth_3y"),
+                            (10, 8, "dividend_growth_10y")):
+        spans = [newest - y for y in by_year if lo <= newest - y <= window]
+        if not spans:
+            continue
+        span = max(spans)
+        g = cagr(by_year[newest], by_year[newest - span], span)
+        if g is not None:
+            out[key] = g
+
+    streak, year = 0, newest
+    # the 0.1% tolerance keeps rounding in the payment history from counting as a raise
+    while (year - 1) in by_year and by_year[year] > by_year[year - 1] * 1.001:
+        streak += 1
+        year -= 1
+    out["dividend_streak_years"] = streak
+    return out
 
 
 def check_columns(db):
@@ -67,7 +158,6 @@ def pick_rows(db, args):
         rows = [r for r in rows
                 if (r.get("dividend_yield") or 0) > 0 or r.get("dividends_updated_at")]
     if args.stale_days:
-        import datetime as _dt
         cutoff = time.time() - args.stale_days * 86400
 
         def is_stale(r):
@@ -75,7 +165,7 @@ def pick_rows(db, args):
             if not ts:
                 return True
             try:
-                return _dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() < cutoff
+                return dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() < cutoff
             except (ValueError, AttributeError):
                 return True
         rows = [r for r in rows if is_stale(r)]
