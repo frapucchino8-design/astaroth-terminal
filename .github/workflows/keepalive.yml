@@ -1,0 +1,32 @@
+name: Keep schedules alive
+
+# GitHub switches off scheduled workflows in a public repository after 60 days
+# with no activity in it. Nothing would warn you first: the data would simply
+# stop updating one day. This pushes an empty commit twice a month, which counts
+# as activity and resets that clock, so none of the schedules ever lapse.
+#
+# It changes no files — the commit is empty on purpose.
+on:
+  schedule:
+    - cron: "9 4 3,18 * *"     # the 3rd and 18th, 04:09 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Empty commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "keepalive: keep the scheduled data updates enabled"
+          git push
