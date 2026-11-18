@@ -19,7 +19,7 @@ on:
       market:
         description: "Which one to update"
         type: choice
-        options: [all, switzerland, etfs, futures, indices, crypto, fx, eurex]
+        options: [all, switzerland, etfs, futures, indices, crypto, fx, eurex, bonds]
         default: all
 
 # An hourly schedule can't be allowed to pile up. If the previous round is
@@ -126,6 +126,31 @@ jobs:
             python scripts/update_fx.py
           else
             python scripts/update_fx.py --fast
+          fi
+
+  bonds:
+    if: ${{ github.event_name == 'schedule' || inputs.market == 'all' || inputs.market == 'bonds' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install -r scripts/requirements.txt
+      - name: Sovereign bond yields
+        env:
+          # Optional. Without it only the US Treasury curve updates, from Yahoo.
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        # The five-year history is only needed to seed the charts, so the hourly
+        # runs just refresh today's yields.
+        run: |
+          if [ "$(date -u +%H)" = "05" ]; then
+            python scripts/update_bonds.py --years 5
+          else
+            python scripts/update_bonds.py --years 1 --no-history
           fi
 
   eurex:
