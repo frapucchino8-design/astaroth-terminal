@@ -34,7 +34,8 @@ from concurrent.futures import ThreadPoolExecutor
 from common import Supabase, log, now_iso
 
 COLUMNS = ("dividend_growth_1y", "dividend_growth_3y", "dividend_growth_5y",
-           "dividend_growth_10y", "dividend_streak_years")
+           "dividend_growth_10y", "dividend_streak_years",
+           "ex_dividend_date", "dividend_pay_date", "dividend_amount")
 
 
 # ---------------------------------------------------------------------------
@@ -174,10 +175,52 @@ def pick_rows(db, args):
     return rows
 
 
-def record_for(yf, sym, region):
+def as_date(value):
+    """Yahoo gives these as epoch seconds; sometimes as a date already."""
+    if value in (None, "", 0):
+        return None
+    try:
+        return dt.datetime.fromtimestamp(float(value), dt.timezone.utc).date().isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        pass
+    try:
+        return dt.date.fromisoformat(str(value)[:10]).isoformat()
+    except (TypeError, ValueError):
+        return None
+
+
+def announced_dates(tk):
+    """The next ex-date, its pay date and the latest payment, when Yahoo has them.
+
+    These are what the site shows as "announced" instead of its own estimate,
+    so a value that can't be read is left out rather than guessed at.
+    """
+    out = {}
+    try:
+        info = tk.info or {}
+    except Exception:
+        return out
+    ex = as_date(info.get("exDividendDate"))
+    pay = as_date(info.get("dividendDate"))
+    if ex:
+        out["ex_dividend_date"] = ex
+    if pay:
+        out["dividend_pay_date"] = pay
+    amount = info.get("lastDividendValue")
+    try:
+        amount = float(amount)
+        if amount > 0:
+            out["dividend_amount"] = round(amount, 6)
+    except (TypeError, ValueError):
+        pass
+    return out
+
+
+def record_for(yf, sym, region, want_dates=True):
     """One instrument's dividend figures, or None when there is nothing to say."""
     try:
-        by_year = dividends_by_year(yf.Ticker(sym))
+        tk = yf.Ticker(sym)
+        by_year = dividends_by_year(tk)
     except Exception:
         return None
     rec = {"symbol": sym, "region": region or "US", "dividends_updated_at": now_iso()}
@@ -186,6 +229,8 @@ def record_for(yf, sym, region):
         if g5 is not None:
             rec["dividend_growth_5y"] = g5
         rec.update(dividend_extras(by_year))
+        if want_dates:
+            rec.update(announced_dates(tk))
     else:
         # Pays nothing, or Yahoo has no record: say so rather than leaving a stale
         # streak from an earlier run standing.
@@ -202,6 +247,9 @@ def main():
                     help="Only names whose dividends are older than this many days (0 = all).")
     ap.add_argument("--all", action="store_true", help="Include names with no dividend yield.")
     ap.add_argument("--workers", type=int, default=4, help="Parallel Yahoo requests (default 4; keep it modest).")
+    ap.add_argument("--no-dates", action="store_true",
+                    help="Skip the announced ex-dividend dates. Roughly twice as fast, since the dates "
+                         "need a second request per name.")
     args = ap.parse_args()
 
     try:
@@ -225,7 +273,7 @@ def main():
     def work(row):
         if stop.is_set():
             return None
-        rec = record_for(yf, row["symbol"], row.get("region"))
+        rec = record_for(yf, row["symbol"], row.get("region"), not args.no_dates)
         with lock:
             done["n"] += 1
             if rec is None:
@@ -253,6 +301,9 @@ def main():
         saved += len(batch)
 
     log(f"Saved {saved} instruments, skipped {done['skipped']}, in {time.monotonic() - started:.0f}s.")
+    if not args.no_dates:
+        log("Announced ex-dates are shown as 'Announced' in the site's Upcoming dividends tab; "
+            "everything else there is estimated from the payment frequency.")
     if saved:
         log("The Dividend screeners on the site pick this up on the next page load.")
 
