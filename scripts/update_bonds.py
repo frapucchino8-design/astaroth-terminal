@@ -110,58 +110,90 @@ def row_for(region, country, currency, label, yield_pct, change_pp, hi=None, lo=
 # ---------------------------------------------------------------------------
 # Yahoo
 # ---------------------------------------------------------------------------
+# A browser-like header set. yfinance's own cookie/crumb handshake is what fails
+# on CI runners (empty frames, 401s), so we skip it and read the public chart
+# endpoint directly — it needs no crumb, just a User-Agent.
+_YH_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+    "Accept": "application/json",
+}
+_YH_HOSTS = ("query1.finance.yahoo.com", "query2.finance.yahoo.com")
+
+
+def _yahoo_chart(sym, years, session):
+    """Weekly closes for one Yahoo symbol via the public chart endpoint.
+
+    Returns (points, live) where points is [(date, value)] oldest-first and live
+    is the latest quote from meta, or (None, None) if every attempt failed.
+    """
+    path = f"/v8/finance/chart/{sym}?range={int(years)}y&interval=1wk"
+    last_err = "no response"
+    for attempt in range(3):
+        host = _YH_HOSTS[attempt % len(_YH_HOSTS)]
+        try:
+            r = session.get(f"https://{host}{path}", headers=_YH_HEADERS, timeout=30)
+        except requests.RequestException as e:
+            last_err = e.__class__.__name__
+        else:
+            if r.status_code == 200:
+                try:
+                    res = (r.json().get("chart") or {}).get("result") or []
+                    if not res:
+                        last_err = "empty result"
+                    else:
+                        res = res[0]
+                        ts = res.get("timestamp") or []
+                        closes = ((res.get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
+                        pts = []
+                        for t, v in zip(ts, closes):
+                            if v is None:
+                                continue
+                            try:
+                                fv = float(v)
+                            except (TypeError, ValueError):
+                                continue
+                            if fv == fv and fv > 0:
+                                pts.append((dt.datetime.utcfromtimestamp(t).date(), round(fv, 4)))
+                        live = num((res.get("meta") or {}).get("regularMarketPrice"))
+                        if pts:
+                            return pts, (live if live and live > 0 else None)
+                        last_err = "no usable points"
+                except (ValueError, KeyError, TypeError) as e:
+                    last_err = f"parse {e.__class__.__name__}"
+            else:
+                last_err = f"HTTP {r.status_code}"
+        time.sleep(1.5 * (attempt + 1))
+    log(f"  {sym}: {last_err}")
+    return None, None
+
+
 def from_yahoo(years):
     """[(row, [(date, yield)])] for the US curve points Yahoo carries."""
-    try:
-        import yfinance as yf
-    except ImportError:
-        raise SystemExit("yfinance isn't installed. pip install -r requirements.txt")
-
     out = []
-    for sym, region, country, currency, label, _yrs in YAHOO:
-        try:
-            tk = yf.Ticker(sym)
-            hist = tk.history(period=f"{years}y", interval="1wk", auto_adjust=False)
-        except Exception as e:
-            log(f"  {sym}: {str(e)[:60]}")
-            continue
-        if hist is None or hist.empty:
-            log(f"  {sym}: no data")
-            continue
-        closes = hist["Close"].dropna()
-        if closes.empty:
-            continue
-
-        points = []
-        for ts, v in closes.items():
-            try:
-                v = float(v)
-            except (TypeError, ValueError):
+    with requests.Session() as session:
+        for sym, region, country, currency, label, _yrs in YAHOO:
+            points, live = _yahoo_chart(sym, years, session)
+            if not points:
                 continue
-            if v == v and v > 0:
-                points.append((ts.date(), round(v, 4)))
 
-        latest = points[-1][1]
-        prev = points[-2][1] if len(points) > 1 else None
-        # The live quote is fresher than the weekly bar, when it is there.
-        try:
-            live = num(tk.fast_info.get("last_price"))
-            if live and live > 0:
+            latest = points[-1][1]
+            prev = points[-2][1] if len(points) > 1 else None
+            # The live quote is fresher than the weekly bar, when it is there.
+            if live is not None:
                 prev = latest if abs(live - latest) > 1e-9 else prev
                 latest = round(float(live), 4)
-        except Exception:
-            pass
 
-        year_ago = [v for d, v in points if (dt.date.today() - d).days <= 366]
-        out.append((
-            row_for(region, country, currency, label, latest,
-                    None if prev is None else latest - prev,
-                    max(year_ago) if year_ago else None,
-                    min(year_ago) if year_ago else None),
-            points,
-        ))
-        log(f"  {sym} → {symbol_for(region, label)}: {latest:.2f}%")
-        time.sleep(0.4)
+            year_ago = [v for d, v in points if (dt.date.today() - d).days <= 366]
+            out.append((
+                row_for(region, country, currency, label, latest,
+                        None if prev is None else latest - prev,
+                        max(year_ago) if year_ago else None,
+                        min(year_ago) if year_ago else None),
+                points,
+            ))
+            log(f"  {sym} → {symbol_for(region, label)}: {latest:.2f}%")
+            time.sleep(0.4)
     return out
 
 
@@ -273,7 +305,11 @@ def main():
             "A free key from fred.stlouisfed.org adds Switzerland, Germany, the UK, Japan and more.")
 
     if not collected:
-        raise SystemExit("Nothing was fetched — no rows written.")
+        # A transient Yahoo outage (rate-limited runner, 403s) shouldn't redline the
+        # whole pipeline — the next scheduled run picks it up. Exit clean, just loudly.
+        log("Nothing was fetched this run — every source was unreachable. "
+            "Leaving existing yields in place; the next run will retry.")
+        return
 
     # FRED wins where both carry the same maturity: it is the official source.
     by_symbol = {}
