@@ -14,11 +14,14 @@ migration_asset_classes.sql installs, and every column above already exists.
 
 Two sources:
 
-  Yahoo   the US Treasury curve, through four index symbols. No key, always on.
-  FRED    full curves for several countries, and a long history. Free, but it
-          needs an API key: sign up at fred.stlouisfed.org/docs/api/api_key.html
-          and put it in the FRED_API_KEY GitHub secret. Without the key this
-          script quietly skips everything but the US Yahoo points.
+  Treasury  the official US Daily Par Yield Curve — the whole curve (1M … 30Y)
+            in one request, no key. The primary US source.
+  Yahoo     four US index symbols. Only a fallback, for the rare case the
+            Treasury feed is unreachable.
+  FRED      full curves for several other countries, and a long history. Free,
+            but it needs an API key: sign up at
+            fred.stlouisfed.org/docs/api/api_key.html and put it in the
+            FRED_API_KEY GitHub secret. Without the key, only the US curve updates.
 
 It also writes weekly closes into price_history, so the "yield over time" chart
 in the site has something to draw. That needs migration_history.sql, which the
@@ -35,6 +38,7 @@ import argparse
 import datetime as dt
 import os
 import time
+import xml.etree.ElementTree as ET
 
 import requests
 
@@ -80,6 +84,22 @@ FRED = [
 
 FRED_URL = "https://api.stlouisfed.org/fred/series/observations"
 
+# ---------------------------------------------------------------------------
+# US Treasury: the official Daily Par Yield Curve. One request returns the whole
+# curve — every maturity, every business day — with no API key. This is the
+# primary US source; Yahoo's four index symbols are only a fallback, because
+# fetching maturities one symbol at a time leaves gaps when some calls fail.
+# ---------------------------------------------------------------------------
+TREASURY_URL = ("https://home.treasury.gov/resource-center/data-chart-center/"
+                "interest-rates/pages/xml")
+TREASURY_FIELDS = [
+    ("BC_1MONTH", "1M", 1 / 12), ("BC_2MONTH", "2M", 2 / 12), ("BC_3MONTH", "3M", 0.25),
+    ("BC_4MONTH", "4M", 4 / 12), ("BC_6MONTH", "6M", 0.5),   ("BC_1YEAR", "1Y", 1),
+    ("BC_2YEAR", "2Y", 2),       ("BC_3YEAR", "3Y", 3),       ("BC_5YEAR", "5Y", 5),
+    ("BC_7YEAR", "7Y", 7),       ("BC_10YEAR", "10Y", 10),    ("BC_20YEAR", "20Y", 20),
+    ("BC_30YEAR", "30Y", 30),
+]
+
 
 def symbol_for(region, label):
     return f"{region}-{label}"
@@ -107,12 +127,94 @@ def row_for(region, country, currency, label, yield_pct, change_pp, hi=None, lo=
     return row
 
 
+# A browser-like User-Agent — both sources below serve CI runners more happily with one.
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+
 # ---------------------------------------------------------------------------
-# Yahoo
+# US Treasury
 # ---------------------------------------------------------------------------
-# A browser-like header set. yfinance's own cookie/crumb handshake is what fails
-# on CI runners (empty frames, 401s), so we skip it and read the public chart
-# endpoint directly — it needs no crumb, just a User-Agent.
+def _treasury_year(year, session):
+    """{date: {label: yield}} for one calendar year of the par yield curve."""
+    params = {"data": "daily_treasury_yield_curve", "field_tdr_date_value": str(year)}
+    try:
+        r = session.get(TREASURY_URL, params=params, headers={"User-Agent": _UA}, timeout=45)
+    except requests.RequestException as e:
+        log(f"  Treasury {year}: {e.__class__.__name__}")
+        return {}
+    if r.status_code != 200:
+        log(f"  Treasury {year}: HTTP {r.status_code}")
+        return {}
+    try:
+        root = ET.fromstring(r.content)
+    except ET.ParseError as e:
+        log(f"  Treasury {year}: parse {e.__class__.__name__}")
+        return {}
+    local = lambda tag: tag.rsplit("}", 1)[-1]          # ignore the Atom/OData namespaces
+    by_date = {}
+    for props in root.iter():
+        if local(props.tag) != "properties":
+            continue
+        fields = {local(c.tag): (c.text or "").strip() for c in props}
+        ds = fields.get("NEW_DATE") or fields.get("Date") or ""
+        try:
+            d = dt.date.fromisoformat(ds[:10])
+        except ValueError:
+            continue
+        row = {}
+        for col, label, _yrs in TREASURY_FIELDS:
+            v = fields.get(col, "")
+            if v in ("", "N/A"):
+                continue
+            try:
+                row[label] = round(float(v), 4)
+            except ValueError:
+                continue
+        if row:
+            by_date[d] = row
+    return by_date
+
+
+def from_treasury(years, want_history):
+    """[(row, [(date, yield)])] for the whole US curve, from the Treasury feed."""
+    end = dt.date.today()
+    start_year = end.year - int(max(1, years)) if want_history else end.year
+    merged = {}
+    with requests.Session() as session:
+        for y in range(start_year, end.year + 1):
+            merged.update(_treasury_year(y, session))
+            time.sleep(0.3)
+        # Guarantee a second date for the day-change, even in the first days of January.
+        if sum(1 for d in merged if d.year == end.year) < 2:
+            merged.update(_treasury_year(end.year - 1, session))
+    if not merged:
+        return []
+    dates = sorted(merged)
+    out = []
+    for col, label, _yrs in TREASURY_FIELDS:
+        points = [(d, merged[d][label]) for d in dates if label in merged[d]]
+        if not points:
+            continue
+        latest = points[-1][1]
+        prev = points[-2][1] if len(points) > 1 else None
+        year_ago = [v for d, v in points if (end - d).days <= 366]
+        out.append((
+            row_for("US", "United States", "USD", label, latest,
+                    None if prev is None else latest - prev,
+                    max(year_ago) if year_ago else None,
+                    min(year_ago) if year_ago else None),
+            points,
+        ))
+        log(f"  Treasury → US-{label}: {latest:.2f}%")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Yahoo (fallback for the US curve)
+# ---------------------------------------------------------------------------
+# yfinance's own cookie/crumb handshake is what fails on CI runners (empty frames,
+# 401s), so we skip it and read the public chart endpoint directly — no crumb needed.
 _YH_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
@@ -285,7 +387,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--years", type=float, default=5, help="How far back to fetch history (default 5).")
     ap.add_argument("--no-history", action="store_true", help="Yields only; don't touch price_history.")
-    ap.add_argument("--fred-only", action="store_true", help="Skip Yahoo.")
+    ap.add_argument("--fred-only", action="store_true", help="Skip the US sources (Treasury / Yahoo).")
     args = ap.parse_args()
 
     db = Supabase()
@@ -293,28 +395,33 @@ def main():
 
     collected = []            # [(row, points)]
     if not args.fred_only:
-        log("Yahoo: the US Treasury curve …")
-        collected += from_yahoo(args.years)
+        log("US Treasury: the official par yield curve …")
+        us = from_treasury(args.years, not args.no_history)
+        if not us:
+            log("Treasury feed unreachable — falling back to Yahoo's index points.")
+            us = from_yahoo(args.years)
+        collected += us
 
     key = os.environ.get("FRED_API_KEY", "").strip()
     if key:
-        log("FRED: full curves …")
+        log("FRED: full curves for other countries …")
         collected += from_fred(key, args.years)
     else:
-        log("No FRED_API_KEY set, so only the US points from Yahoo are updated. "
+        log("No FRED_API_KEY set, so only the US curve is updated. "
             "A free key from fred.stlouisfed.org adds Switzerland, Germany, the UK, Japan and more.")
 
     if not collected:
-        # A transient Yahoo outage (rate-limited runner, 403s) shouldn't redline the
-        # whole pipeline — the next scheduled run picks it up. Exit clean, just loudly.
+        # A transient outage (rate-limited runner, 403s) shouldn't redline the whole
+        # pipeline — the next scheduled run picks it up. Exit clean, just loudly.
         log("Nothing was fetched this run — every source was unreachable. "
             "Leaving existing yields in place; the next run will retry.")
         return
 
-    # FRED wins where both carry the same maturity: it is the official source.
+    # The first source to carry a symbol wins: Treasury is authoritative for the US
+    # curve, and FRED only adds the countries Treasury doesn't cover.
     by_symbol = {}
     for row, points in collected:
-        by_symbol[row["symbol"]] = (row, points)
+        by_symbol.setdefault(row["symbol"], (row, points))
 
     rows = [row for row, _ in by_symbol.values()]
     db.upsert(rows)
