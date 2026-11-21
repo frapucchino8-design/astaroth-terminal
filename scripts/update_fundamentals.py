@@ -1,49 +1,190 @@
-"""Fill in the extra fundamentals the new screeners use.
+"""Comprehensive fundamentals for the screeners, straight from Yahoo.
 
-Covers free cash flow per share, revenue per share, shares outstanding, ROIC,
-receivable days, debt/assets, cash and cash as a share of assets, dividend
-growth over one, three, five and ten years, the dividend streak (years of
-raises in a row), and earnings growth over three, five and ten years.
+This is the authoritative fundamentals source. It reads Yahoo's quoteSummary
+endpoint directly — the same data behind the "Key Statistics" page — and fills
+every column the screeners use, so a filter like "PEG under 1" actually has a
+number for (almost) every stock instead of one in two.
 
-Everything comes from Yahoo through yfinance: `info` for the headline figures,
-and the yearly balance sheet / income statement / dividend history for the ones
-that need several years. That makes it slow — a few seconds per name — so it is
-built to run in slices and pick up where it stopped:
+Why not yfinance: on a CI runner yfinance's cookie/crumb handshake often returns
+empty `info`, which is exactly why coverage used to be patchy. We do the crumb
+handshake once ourselves and hit the JSON endpoint directly, which is far more
+reliable at scale.
 
-    python update_fundamentals.py --region US --limit 300
+What it writes, per stock (whatever Yahoo has):
+  valuation   pe, forward_pe, pb, ps, ev_ebitda, book_value_ps
+  dividend    dividend_yield                     (growth/streak: update_dividends.py)
+  growth      eps_growth, revenue_growth (annual), earnings_growth_q, revenue_growth_q,
+              eps_growth_3y / 5y / 10y
+  quality     net_margin, gross_margin, operating_margin, roe, roa, roic, receivable_days
+  balance     current_ratio, quick_ratio, debt_to_equity, debt_to_assets,
+              cash_usd_m, cash_pct_assets, ebitda_usd_m
+  size/share  market_cap_usd_b, shares_outstanding_m, revenue_ps, fcf_ps
+  risk        beta, short_pct_float, high_52w, low_52w
+
+It runs in slices, oldest-first, and picks up where it stopped:
+
+    python update_fundamentals.py --limit 300
     python update_fundamentals.py --region Switzerland
-    python update_fundamentals.py --stale-days 30 --deadline 18000
+    python update_fundamentals.py --stale-days 2 --deadline 11000
 
-Run supabase/migration_fundamentals.sql first, or every write will fail on a
-missing column. The dividend windows and the streak also need
-supabase/migration_dividends.sql; until that has been run they are skipped
-(with a note in the log) and everything else is written as before.
+Columns live in migration_fundamentals.sql and migration_fundamentals2.sql. Any
+that haven't been created yet are detected and simply left out of the write, so
+nothing fails before the migration is run.
 
 Needs SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY, like the other scripts.
 """
 import argparse
 import datetime as _dt
-import math
 import time
+
+import requests
 
 from common import Supabase, log, now_iso, num, to_usd
 
 TAX = 0.21   # assumed cash tax rate for the ROIC numerator
 
-# Columns added by migration_dividends.sql.
-DIVIDEND_EXTRA_COLS = ("dividend_growth_1y", "dividend_growth_3y", "dividend_growth_10y", "dividend_streak_years")
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+_HOSTS = ("query1.finance.yahoo.com", "query2.finance.yahoo.com")
+MODULES = ("summaryDetail,defaultKeyStatistics,financialData,price,"
+           "incomeStatementHistory,balanceSheetHistory")
+
+# Columns added by each migration. We probe which exist and never write one that
+# doesn't, so a missing migration degrades to "fewer columns", never a failure.
+CORE_COLS = ["pe", "pb", "dividend_yield", "beta", "revenue_growth", "eps_growth",
+             "net_margin", "high_52w", "low_52w", "market_cap_usd_b"]
+EXTRA1 = ["fcf_ps", "revenue_ps", "shares_outstanding_m", "roic", "receivable_days",
+          "debt_to_assets", "cash_usd_m", "cash_pct_assets",
+          "eps_growth_3y", "eps_growth_5y", "eps_growth_10y"]
+EXTRA2 = ["roe", "roa", "gross_margin", "operating_margin", "current_ratio",
+          "quick_ratio", "debt_to_equity", "forward_pe", "ps", "ev_ebitda",
+          "earnings_growth_q", "revenue_growth_q", "ebitda_usd_m",
+          "book_value_ps", "short_pct_float"]
+
+
+# ---------------------------------------------------------------------------
+# Yahoo quoteSummary client
+# ---------------------------------------------------------------------------
+class Yahoo:
+    """One crumb/cookie handshake, then direct quoteSummary reads."""
+
+    def __init__(self):
+        self.s = requests.Session()
+        self.s.headers.update({"User-Agent": _UA, "Accept": "application/json"})
+        self.crumb = None
+
+    def _bootstrap(self):
+        # A GET to the consumer site sets the A1/A3 cookies the crumb is tied to.
+        for url in ("https://fc.yahoo.com/", "https://finance.yahoo.com/"):
+            try:
+                self.s.get(url, timeout=15)
+            except requests.RequestException:
+                pass
+        for host in _HOSTS:
+            try:
+                r = self.s.get(f"https://{host}/v1/test/getcrumb", timeout=15)
+            except requests.RequestException:
+                continue
+            txt = (r.text or "").strip()
+            if r.status_code == 200 and txt and "<" not in txt and "Too Many" not in txt:
+                self.crumb = txt
+                return True
+        return False
+
+    def summary(self, sym):
+        """The quoteSummary result object for one symbol, or None."""
+        if self.crumb is None and not self._bootstrap():
+            return None
+        params = {"modules": MODULES, "crumb": self.crumb}
+        for attempt in range(4):
+            host = _HOSTS[attempt % 2]
+            try:
+                r = self.s.get(f"https://{host}/v10/finance/quoteSummary/{sym}",
+                               params=params, timeout=25)
+            except requests.RequestException:
+                time.sleep(1.2 * (attempt + 1))
+                continue
+            if r.status_code == 200:
+                try:
+                    res = ((r.json().get("quoteSummary") or {}).get("result")) or []
+                except ValueError:
+                    return None
+                return res[0] if res else None
+            if r.status_code in (401, 403):
+                # Crumb went stale — refresh once and retry.
+                self.crumb = None
+                if not self._bootstrap():
+                    return None
+                params["crumb"] = self.crumb
+                continue
+            if r.status_code == 404:
+                return None                    # not a Yahoo symbol
+            if r.status_code == 429:
+                time.sleep(6 * (attempt + 1))
+                continue
+            time.sleep(1.2 * (attempt + 1))
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Pulling values out of the nested {raw, fmt} shapes
+# ---------------------------------------------------------------------------
+def g(mod, *keys):
+    """A numeric field from a module, unwrapping Yahoo's {raw: ...} boxes."""
+    if not isinstance(mod, dict):
+        return None
+    for key in keys:
+        v = mod.get(key)
+        if isinstance(v, dict):
+            v = v.get("raw")
+        n = num(v)
+        if n is not None:
+            return n
+    return None
+
+
+def pct(mod, *keys):
+    """A fraction field (0.18) returned as a percent (18.0)."""
+    v = g(mod, *keys)
+    return None if v is None else round(v * 100, 2)
+
+
+def annual_series(statements, *field_names):
+    """[(year, value)] newest-first from a quoteSummary statement list."""
+    out = []
+    for st in statements or []:
+        if not isinstance(st, dict):
+            continue
+        val = None
+        for f in field_names:
+            val = g(st, f)
+            if val is not None:
+                break
+        if val is None:
+            continue
+        end = st.get("endDate")
+        year = None
+        if isinstance(end, dict):
+            # endDate.fmt looks like "2025-12-31"; its raw is a unix timestamp.
+            fmt = end.get("fmt")
+            if fmt and len(fmt) >= 4 and fmt[:4].isdigit():
+                year = int(fmt[:4])
+            elif end.get("raw"):
+                year = _dt.datetime.utcfromtimestamp(end["raw"]).year
+        out.append((year, val))
+    out.sort(key=lambda t: (t[0] or 0), reverse=True)
+    return out
 
 
 def cagr(new, old, years):
-    """Compound annual growth, in percent. None when it can't be computed."""
+    """Compound annual growth, percent. None when it can't be computed."""
     try:
         new, old, years = float(new), float(old), float(years)
     except (TypeError, ValueError):
         return None
     if years <= 0 or old == 0:
         return None
-    # A sign change makes a growth rate meaningless.
-    if (new < 0) != (old < 0):
+    if (new < 0) != (old < 0):      # a sign change makes growth meaningless
         return None
     if new < 0 and old < 0:
         new, old = -new, -old
@@ -57,60 +198,25 @@ def cagr(new, old, years):
         return None
 
 
-def first_row(frame, *names):
-    """Pull a row out of a yfinance statement frame by any of several labels."""
-    if frame is None or getattr(frame, "empty", True):
+def growth_1y(series):
+    """Newest-over-previous year growth, percent."""
+    if len(series) < 2:
         return None
-    index = {str(i).strip().lower(): i for i in frame.index}
-    for n in names:
-        key = n.strip().lower()
-        if key in index:
-            return frame.loc[index[key]]
-    return None
+    (ny, nv), (oy, ov) = series[0], series[1]
+    span = (ny - oy) if (ny and oy) else 1
+    return cagr(nv, ov, span or 1)
 
 
-def series_values(row):
-    """A statement row as [(year, value)], newest first, skipping blanks."""
-    if row is None:
-        return []
-    out = []
-    for col, val in row.items():
-        try:
-            v = float(val)
-        except (TypeError, ValueError):
-            continue
-        if v != v:
-            continue
-        year = getattr(col, "year", None)
-        out.append((year, v))
-    return out
-
-
-def eps_growth_windows(tk):
-    """EPS growth over 3, 5 and 10 years, from the yearly income statement."""
+def growth_windows(series):
+    """3/5/10-year CAGR from an annual series (as many as the data allows)."""
     out = {"eps_growth_3y": None, "eps_growth_5y": None, "eps_growth_10y": None}
-    try:
-        inc = tk.income_stmt
-    except Exception:
+    if len(series) < 2 or series[0][0] is None:
         return out
-    eps_row = first_row(inc, "Diluted EPS", "Basic EPS")
-    vals = series_values(eps_row)
-    if len(vals) < 2:
-        # Fall back to net income / shares, which is close enough for a growth rate.
-        ni = series_values(first_row(inc, "Net Income", "Net Income Common Stockholders"))
-        sh = series_values(first_row(inc, "Diluted Average Shares", "Basic Average Shares"))
-        if len(ni) >= 2 and len(sh) >= 2:
-            per = {y: v for y, v in sh if v}
-            vals = [(y, v / per[y]) for y, v in ni if y in per]
-    if len(vals) < 2:
-        return out
-    vals.sort(key=lambda t: (t[0] or 0), reverse=True)
-    newest_year, newest = vals[0]
+    newest_year, newest = series[0]
     for window, key in ((3, "eps_growth_3y"), (5, "eps_growth_5y"), (10, "eps_growth_10y")):
-        # the oldest point no further back than `window` years
         best = None
-        for year, v in vals[1:]:
-            if year is None or newest_year is None:
+        for year, v in series[1:]:
+            if year is None:
                 continue
             span = newest_year - year
             if 0 < span <= window and (best is None or span > best[0]):
@@ -120,161 +226,155 @@ def eps_growth_windows(tk):
     return out
 
 
-def dividends_by_year(tk):
-    """Dividends per share summed by calendar year, complete years only.
+# ---------------------------------------------------------------------------
+# Turn one quoteSummary result into a row of columns
+# ---------------------------------------------------------------------------
+def build_row(res, currency):
+    sd = res.get("summaryDetail") or {}
+    ks = res.get("defaultKeyStatistics") or {}
+    fd = res.get("financialData") or {}
+    pr = res.get("price") or {}
+    inc = (res.get("incomeStatementHistory") or {}).get("incomeStatementHistory") or []
+    bs = (res.get("balanceSheetHistory") or {}).get("balanceSheetStatements") or []
 
-    The current year is left out because it is usually unfinished, which would
-    make every company look like it had just cut its dividend.
-    """
-    try:
-        divs = tk.dividends
-    except Exception:
-        return {}
-    if divs is None or len(divs) == 0:
-        return {}
-    by_year = {}
-    for ts, amount in divs.items():
-        try:
-            by_year.setdefault(ts.year, 0.0)
-            by_year[ts.year] += float(amount)
-        except (TypeError, ValueError, AttributeError):
-            continue
-    this_year = _dt.date.today().year
-    return {y: v for y, v in by_year.items() if y < this_year and v > 0}
+    fx = to_usd(currency) or 1.0
+    rec = {}
 
+    def put(col, val):
+        if val is not None:
+            rec[col] = val
 
-def dividend_growth_5y(by_year):
-    """Five-year growth in dividends per share, from the yearly totals."""
-    years = sorted(by_year)
-    if len(years) < 3:
-        return None
-    newest = years[-1]
-    target = [y for y in years if newest - y <= 5 and newest - y >= 3]
-    if not target:
-        target = years[:1]
-    oldest = min(target)
-    return cagr(by_year[newest], by_year[oldest], newest - oldest)
+    # ---- valuation ----
+    put("pe", g(sd, "trailingPE") or g(ks, "trailingPE"))
+    put("forward_pe", g(sd, "forwardPE") or g(ks, "forwardPE"))
+    put("pb", g(ks, "priceToBook"))
+    put("ps", g(sd, "priceToSalesTrailing12Months"))
+    put("ev_ebitda", g(ks, "enterpriseToEbitda"))
+    put("book_value_ps", g(ks, "bookValue"))
 
+    # ---- dividend yield (growth & streak are update_dividends.py's job) ----
+    dy = g(sd, "dividendYield")
+    if dy is None:
+        dy = g(sd, "trailingAnnualDividendYield")
+    if dy is not None:
+        # Yahoo gives a fraction (0.032). Guard the odd feed that already sends 3.2.
+        put("dividend_yield", round(dy * 100, 3) if dy < 1 else round(dy, 3))
 
-def dividend_extras(by_year):
-    """Dividend growth over 1, 3 and 10 years, and the streak of raises.
+    # ---- margins & returns on capital ----
+    put("net_margin", pct(fd, "profitMargins") or pct(ks, "profitMargins"))
+    put("gross_margin", pct(fd, "grossMargins"))
+    put("operating_margin", pct(fd, "operatingMargins"))
+    put("roe", pct(fd, "returnOnEquity"))
+    put("roa", pct(fd, "returnOnAssets"))
 
-    Only for companies that paid in the last full calendar year: growth to a
-    payment that stopped years ago says nothing about today.
+    # ---- liquidity / leverage ----
+    put("current_ratio", g(fd, "currentRatio"))
+    put("quick_ratio", g(fd, "quickRatio"))
+    put("debt_to_equity", g(fd, "debtToEquity"))   # already a percent in Yahoo's feed
 
-    The streak counts back from the last full year for as long as each year's
-    total was higher than the year before. A flat or lower year ends it, and so
-    does a gap in the record. 0 means "pays, but did not raise last year".
-    """
-    out = {}
-    if not by_year:
-        return out
-    last_full = _dt.date.today().year - 1
-    newest = max(by_year)
-    if newest < last_full:
-        # Paid in the past, nothing last year: the streak is over.
-        out["dividend_streak_years"] = 0
-        return out
+    # ---- risk / range ----
+    put("beta", g(sd, "beta") or g(ks, "beta"))
+    put("high_52w", g(sd, "fiftyTwoWeekHigh"))
+    put("low_52w", g(sd, "fiftyTwoWeekLow"))
+    put("short_pct_float", pct(ks, "shortPercentOfFloat"))
 
-    # 1 and 3 years use exactly that span. 10 years accepts 8-10, the same
-    # leniency the 5-year figure has, so a nine-year record still gets a number.
-    for window, lo, key in ((1, 1, "dividend_growth_1y"), (3, 3, "dividend_growth_3y"), (10, 8, "dividend_growth_10y")):
-        spans = [newest - y for y in by_year if lo <= newest - y <= window]
-        if not spans:
-            continue
-        span = max(spans)
-        g = cagr(by_year[newest], by_year[newest - span], span)
-        if g is not None:
-            out[key] = g
+    # ---- size / per share ----
+    cap = g(pr, "marketCap") or g(sd, "marketCap") or g(ks, "marketCap")
+    if cap is not None:
+        put("market_cap_usd_b", round(cap * fx / 1e9, 3))
+    shares = g(ks, "sharesOutstanding") or g(ks, "impliedSharesOutstanding")
+    if shares:
+        put("shares_outstanding_m", round(shares / 1e6, 3))
+    ebitda = g(fd, "ebitda")
+    if ebitda is not None:
+        put("ebitda_usd_m", round(ebitda * fx / 1e6, 2))
 
-    streak, year = 0, newest
-    # the 0.1% tolerance keeps rounding in the payment history from counting as a raise
-    while (year - 1) in by_year and by_year[year] > by_year[year - 1] * 1.001:
-        streak += 1
-        year -= 1
-    out["dividend_streak_years"] = streak
-    return out
+    revenue = g(fd, "totalRevenue")
+    if revenue is None:
+        rev_series_now = annual_series(inc, "totalRevenue")
+        revenue = rev_series_now[0][1] if rev_series_now else None
 
+    rps = g(fd, "revenuePerShare")
+    if rps is None and revenue and shares:
+        rps = revenue / shares
+    put("revenue_ps", None if rps is None else round(rps, 4))
 
-def has_dividend_columns(db):
-    """True once migration_dividends.sql has been run."""
-    try:
-        r = db.s.get(f"{db.url}/stocks", params={"select": ",".join(DIVIDEND_EXTRA_COLS), "limit": "1"}, timeout=30)
-        return r.status_code < 300
-    except Exception:
-        return False
+    fcf = g(fd, "freeCashflow")
+    if fcf is None:
+        ocf = g(fd, "operatingCashflow")
+        # capex isn't in these modules; operating cash flow alone is a usable floor
+        fcf = ocf
+    if fcf is not None and shares:
+        put("fcf_ps", round(fcf / shares, 4))
 
+    # ---- quarterly growth ----
+    put("earnings_growth_q", pct(ks, "earningsQuarterlyGrowth") or pct(fd, "earningsGrowth"))
+    put("revenue_growth_q", pct(fd, "revenueGrowth"))
 
-def balance_sheet_metrics(tk, info, price, currency):
-    """Debt/assets, cash, cash share of assets, receivable days, ROIC."""
-    out = {}
-    total_assets = total_debt = cash = receivables = None
-    try:
-        bs = tk.balance_sheet
-        total_assets = next((v for _, v in series_values(first_row(bs, "Total Assets"))), None)
-        total_debt = next((v for _, v in series_values(first_row(bs, "Total Debt"))), None)
-        cash = next((v for _, v in series_values(first_row(
-            bs, "Cash Cash Equivalents And Short Term Investments",
-            "Cash And Cash Equivalents"))), None)
-        receivables = next((v for _, v in series_values(first_row(
-            bs, "Accounts Receivable", "Receivables"))), None)
-        equity = next((v for _, v in series_values(first_row(
-            bs, "Stockholders Equity", "Total Equity Gross Minority Interest"))), None)
-    except Exception:
-        equity = None
+    # ---- annual growth (what PEG uses) + multi-year windows ----
+    ni_series = annual_series(inc, "netIncome")
+    rev_series = annual_series(inc, "totalRevenue")
+    eg = growth_1y(ni_series)
+    if eg is None:
+        eg = pct(ks, "earningsQuarterlyGrowth")
+    put("eps_growth", eg)
+    rg = growth_1y(rev_series)
+    if rg is None:
+        rg = pct(fd, "revenueGrowth")
+    put("revenue_growth", rg)
+    for k, v in growth_windows(ni_series).items():
+        put(k, v)
 
-    # info is often more current than the statements
-    total_debt = total_debt if total_debt is not None else num(info.get("totalDebt"))
-    cash = cash if cash is not None else num(info.get("totalCash"))
+    # ---- balance sheet ----
+    total_assets = next((v for _, v in annual_series(bs, "totalAssets")), None)
+    equity = next((v for _, v in annual_series(
+        bs, "totalStockholderEquity", "stockholdersEquity")), None)
+    receivables = next((v for _, v in annual_series(
+        bs, "netReceivables", "accountsReceivable")), None)
+    total_debt = g(fd, "totalDebt")
+    cash = g(fd, "totalCash")
+    if cash is None:
+        cash = next((v for _, v in annual_series(bs, "cash", "cashAndCashEquivalents")), None)
 
     if total_assets and total_debt is not None:
-        out["debt_to_assets"] = round(total_debt / total_assets * 100, 2)
+        put("debt_to_assets", round(total_debt / total_assets * 100, 2))
     if total_assets and cash is not None:
-        out["cash_pct_assets"] = round(cash / total_assets * 100, 2)
+        put("cash_pct_assets", round(cash / total_assets * 100, 2))
     if cash is not None:
-        fx = to_usd(currency) or 1.0
-        out["cash_usd_m"] = round(cash * fx / 1e6, 2)
-
-    revenue = num(info.get("totalRevenue"))
-    if revenue is None:
-        try:
-            revenue = next((v for _, v in series_values(first_row(tk.income_stmt, "Total Revenue"))), None)
-        except Exception:
-            revenue = None
+        put("cash_usd_m", round(cash * fx / 1e6, 2))
     if revenue and receivables is not None:
-        out["receivable_days"] = round(receivables / revenue * 365, 1)
+        put("receivable_days", round(receivables / revenue * 365, 1))
 
-    # ROIC = EBIT after an assumed tax rate, over invested capital
-    ebit = num(info.get("ebit")) or num(info.get("ebitda"))
-    if ebit is None:
-        try:
-            ebit = next((v for _, v in series_values(first_row(tk.income_stmt, "EBIT", "Operating Income"))), None)
-        except Exception:
-            ebit = None
+    # ROIC = EBIT after an assumed tax, over invested capital
+    ebit = next((v for _, v in annual_series(inc, "ebit", "operatingIncome")), None)
     if ebit is not None and equity and total_debt is not None:
         invested = equity + total_debt - (cash or 0)
         if invested and invested > 0:
-            out["roic"] = round(ebit * (1 - TAX) / invested * 100, 2)
-    return out, revenue
+            put("roic", round(ebit * (1 - TAX) / invested * 100, 2))
+
+    return rec
 
 
-def per_share(info, revenue, shares):
-    out = {}
-    if shares:
-        out["shares_outstanding_m"] = round(shares / 1e6, 3)
-    fcf = num(info.get("freeCashflow"))
-    if fcf is None:
-        ocf, capex = num(info.get("operatingCashflow")), num(info.get("capitalExpenditures"))
-        if ocf is not None and capex is not None:
-            fcf = ocf + capex          # capex comes through negative
-    if fcf is not None and shares:
-        out["fcf_ps"] = round(fcf / shares, 4)
-    rps = num(info.get("revenuePerShare"))
-    if rps is None and revenue and shares:
-        rps = revenue / shares
-    if rps is not None:
-        out["revenue_ps"] = round(rps, 4)
-    return out
+# ---------------------------------------------------------------------------
+# Which of the optional columns actually exist in this database
+# ---------------------------------------------------------------------------
+def existing_columns(db, candidates):
+    try:
+        r = db.s.get(f"{db.url}/stocks",
+                     params={"select": ",".join(candidates), "limit": "1"}, timeout=30)
+        if r.status_code < 300:
+            return set(candidates)
+    except requests.RequestException:
+        pass
+    ok = set()
+    for c in candidates:
+        try:
+            r = db.s.get(f"{db.url}/stocks", params={"select": c, "limit": "1"}, timeout=20)
+            if r.status_code < 300:
+                ok.add(c)
+        except requests.RequestException:
+            pass
+    return ok
 
 
 def main():
@@ -284,13 +384,8 @@ def main():
     ap.add_argument("--deadline", type=float, default=0, help="Seconds before saving what we have and stopping.")
     ap.add_argument("--stale-days", type=int, default=0,
                     help="Only names whose fundamentals are older than this many days (0 = all).")
-    ap.add_argument("--sleep", type=float, default=0.8, help="Pause between names, to stay under Yahoo's limits.")
+    ap.add_argument("--sleep", type=float, default=0.6, help="Pause between names, to stay under Yahoo's limits.")
     args = ap.parse_args()
-
-    try:
-        import yfinance as yf
-    except ImportError:
-        raise SystemExit("yfinance isn't installed. pip install -r requirements.txt")
 
     started = time.monotonic()
     out_of_time = lambda: args.deadline and (time.monotonic() - started) > args.deadline
@@ -299,7 +394,8 @@ def main():
     filters = {"asset_class": "in.(stock,reit)"}
     if args.region:
         filters["region"] = f"eq.{args.region}"
-    rows = db.select("symbol,currency,price,region,fundamentals_updated_at", filters, order="symbol")
+    rows = db.select("symbol,currency,region,fundamentals_updated_at", filters,
+                     order="fundamentals_updated_at.asc.nullsfirst")
     if args.stale_days:
         cutoff = time.time() - args.stale_days * 86400
         def is_stale(r):
@@ -318,60 +414,50 @@ def main():
     if not rows:
         return
 
-    # The 1/3/10-year dividend windows and the streak live in columns added by
-    # migration_dividends.sql. Writing them before it has run would fail the
-    # whole batch, so check once and leave them out if they aren't there yet.
-    write_div_extras = has_dividend_columns(db)
-    if not write_div_extras:
-        log("  dividend_growth_1y/3y/10y and dividend_streak_years aren't in the database yet — "
-            "run supabase/migration_dividends.sql to fill the Dividend screeners. Skipping them this run.")
+    allowed = set(CORE_COLS) | existing_columns(db, EXTRA1 + EXTRA2)
+    missing = (set(EXTRA1) | set(EXTRA2)) - allowed
+    if missing:
+        have2 = allowed & set(EXTRA2)
+        if not have2:
+            log("  The new columns (roe, roa, current_ratio, forward_pe, ps …) aren't in the "
+                "database yet — run supabase/migration_fundamentals2.sql to switch on those screeners.")
+        else:
+            log(f"  {len(missing)} optional column(s) not in the database yet; leaving them out: "
+                + ", ".join(sorted(missing)))
 
+    yahoo = Yahoo()
     batch, saved, skipped = [], 0, 0
     for i, row in enumerate(rows, 1):
         if out_of_time():
             log(f"  deadline reached after {i - 1}/{len(rows)}")
             break
         sym = row["symbol"]
-        try:
-            tk = yf.Ticker(sym)
-            info = tk.info or {}
-        except Exception as e:
+        res = yahoo.summary(sym)
+        if not res:
             skipped += 1
-            if i % 25 == 0:
-                log(f"  {i}/{len(rows)} (skipped {sym}: {str(e)[:40]})")
-            continue
-        if not info:
-            skipped += 1
+            if i % 50 == 0:
+                log(f"  {i}/{len(rows)} (no data for {sym})")
+            time.sleep(args.sleep)
             continue
 
-        shares = num(info.get("sharesOutstanding")) or num(info.get("impliedSharesOutstanding"))
-        currency = row.get("currency") or info.get("currency") or "USD"
-        bs, revenue = balance_sheet_metrics(tk, info, row.get("price"), currency)
-
-        rec = {"symbol": sym, "region": row.get("region") or "US"}
-        rec.update(bs)
-        rec.update(per_share(info, revenue, shares))
-        rec.update(eps_growth_windows(tk))
-        by_year = dividends_by_year(tk)
-        dg = dividend_growth_5y(by_year)
-        if dg is not None:
-            rec["dividend_growth_5y"] = dg
-        if write_div_extras:
-            rec.update(dividend_extras(by_year))
+        currency = row.get("currency") or ((res.get("price") or {}).get("currency")) or "USD"
+        rec = build_row(res, currency)
+        rec = {k: v for k, v in rec.items() if k in allowed}
+        if not rec:
+            skipped += 1
+            time.sleep(args.sleep)
+            continue
+        rec["symbol"] = sym
+        rec["region"] = row.get("region") or "US"
         rec["fundamentals_updated_at"] = now_iso()
-
-        # Only write if we actually learned something beyond the keys we always set.
-        if len(rec) > 3:
-            batch.append(rec)
-        else:
-            skipped += 1
+        batch.append(rec)
 
         if len(batch) >= 40:
             db.upsert(batch)
             saved += len(batch)
             batch = []
             log(f"  {i}/{len(rows)} — {saved} saved")
-        elif i % 25 == 0:
+        elif i % 50 == 0:
             log(f"  {i}/{len(rows)}")
         time.sleep(args.sleep)
 
