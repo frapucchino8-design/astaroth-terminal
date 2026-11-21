@@ -103,8 +103,15 @@ def parse_holdings(text, grade, source):
     reader = csv.DictReader(io.StringIO("\n".join(lines[start:])))
     out = []
     for row in reader:
-        # normalise keys (strip, drop the trailing "(%)" etc. so lookups are stable)
-        r = { (k or "").strip(): (v or "").strip() for k, v in row.items() }
+        # Normalise. DictReader collects any columns beyond the header into a list
+        # under the None key, and missing ones come back as None — handle both.
+        r = {}
+        for k, v in row.items():
+            if k is None:
+                continue
+            if isinstance(v, list):
+                v = v[0] if v else ""
+            r[k.strip()] = (v or "").strip()
 
         def g(*names):
             for n in names:
