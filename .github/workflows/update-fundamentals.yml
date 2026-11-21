@@ -1,0 +1,57 @@
+name: Update fundamentals
+
+# The deep fundamentals every screener reads — valuation, margins, returns on
+# capital, balance-sheet ratios, growth — straight from Yahoo's quoteSummary.
+#
+# update_fundamentals.py reads the most-stale names first and stops at its
+# deadline, so each run advances the list and the whole universe (~10k US names)
+# comes round every day or so. It's the authoritative fundamentals source and
+# overwrites the sparse Finnhub values with Yahoo's fuller ones.
+#
+# Run these once in the Supabase SQL editor before the first run (safe to re-run):
+#   supabase/migration_fundamentals.sql
+#   supabase/migration_fundamentals2.sql
+# Any column that isn't there yet is detected and simply left out — nothing fails.
+on:
+  schedule:
+    - cron: "23 */3 * * *"       # every three hours, on a quiet minute
+  workflow_dispatch:
+    inputs:
+      region:
+        description: "Limit to one region (blank = everything, oldest first)"
+        default: ""
+      stale_days:
+        description: "Only refresh names older than this many days (0 = all)"
+        default: "1"
+
+# Queue, never overlap: Yahoo keeps better to one caller at a time, and each run
+# saves as it goes and resumes where it stopped.
+concurrency:
+  group: update-fundamentals
+  cancel-in-progress: false
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+jobs:
+  fundamentals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 185
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install -r scripts/requirements.txt
+      - name: Refresh fundamentals (oldest first)
+        env:
+          REGION: ${{ inputs.region }}
+          STALE: ${{ inputs.stale_days || '1' }}
+        # ~170 minutes of work, then it stops cleanly; the next run continues.
+        run: |
+          ARGS="--deadline 10200 --stale-days $STALE --sleep 0.6"
+          if [ -n "$REGION" ]; then ARGS="$ARGS --region $REGION"; fi
+          python scripts/update_fundamentals.py $ARGS
