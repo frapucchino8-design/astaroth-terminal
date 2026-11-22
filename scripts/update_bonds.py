@@ -18,10 +18,9 @@ Two sources:
             in one request, no key. The primary US source.
   Yahoo     four US index symbols. Only a fallback, for the rare case the
             Treasury feed is unreachable.
-  FRED      full curves for several other countries, and a long history. Free,
-            but it needs an API key: sign up at
-            fred.stlouisfed.org/docs/api/api_key.html and put it in the
-            FRED_API_KEY GitHub secret. Without the key, only the US curve updates.
+  FRED      10-year benchmark yields for the other countries (Switzerland,
+            Germany, the UK, Japan, France, Italy, Canada and more), from the
+            Fed's keyless CSV download — no API key needed.
 
 It also writes weekly closes into price_history, so the "yield over time" chart
 in the site has something to draw. That needs migration_history.sql, which the
@@ -35,8 +34,9 @@ history is skipped.
 Needs SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY, like the other scripts.
 """
 import argparse
+import csv
 import datetime as dt
-import os
+import io
 import time
 import xml.etree.ElementTree as ET
 
@@ -82,7 +82,7 @@ FRED = [
     ("IRLTLT01CAM156N", "Canada",      "Canada",      "CAD", "10Y", 10),
 ]
 
-FRED_URL = "https://api.stlouisfed.org/fred/series/observations"
+FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 
 # ---------------------------------------------------------------------------
 # US Treasury: the official Daily Par Yield Curve. One request returns the whole
@@ -302,35 +302,38 @@ def from_yahoo(years):
 # ---------------------------------------------------------------------------
 # FRED
 # ---------------------------------------------------------------------------
-def fred_series(key, series_id, start):
-    params = {"series_id": series_id, "api_key": key, "file_type": "json",
-              "observation_start": start.isoformat()}
+def fred_series(series_id, start):
+    """Observations for one FRED series via the keyless CSV download — no API key."""
+    params = {"id": series_id, "cosd": start.isoformat()}
     try:
-        r = requests.get(FRED_URL, params=params, timeout=45)
+        r = requests.get(FRED_CSV_URL, params=params, headers={"User-Agent": _UA}, timeout=45)
     except requests.RequestException as e:
         log(f"  {series_id}: {e.__class__.__name__}")
         return []
-    if r.status_code == 400 and "api_key" in r.text:
-        raise SystemExit("FRED rejected the API key. Check the FRED_API_KEY secret.")
     if r.status_code >= 300:
         log(f"  {series_id}: HTTP {r.status_code}")
         return []
     out = []
-    for o in r.json().get("observations", []):
-        if o.get("value") in (None, ".", ""):
+    reader = csv.reader(io.StringIO(r.text))
+    rows = list(reader)
+    for row in rows[1:]:                     # first row is the header
+        if len(row) < 2:
+            continue
+        ds, val = row[0].strip(), row[1].strip()
+        if val in ("", ".", "NA", "n/a"):
             continue
         try:
-            out.append((dt.date.fromisoformat(o["date"]), round(float(o["value"]), 4)))
+            out.append((dt.date.fromisoformat(ds), round(float(val), 4)))
         except (ValueError, TypeError):
             continue
     return out
 
 
-def from_fred(key, years):
+def from_fred(years):
     start = dt.date.today() - dt.timedelta(days=int(years * 365.25))
     out = []
     for series_id, region, country, currency, label, _yrs in FRED:
-        points = fred_series(key, series_id, start)
+        points = fred_series(series_id, start)
         if len(points) < 2:
             continue
         latest, prev = points[-1][1], points[-2][1]
@@ -402,13 +405,8 @@ def main():
             us = from_yahoo(args.years)
         collected += us
 
-    key = os.environ.get("FRED_API_KEY", "").strip()
-    if key:
-        log("FRED: full curves for other countries …")
-        collected += from_fred(key, args.years)
-    else:
-        log("No FRED_API_KEY set, so only the US curve is updated. "
-            "A free key from fred.stlouisfed.org adds Switzerland, Germany, the UK, Japan and more.")
+    log("FRED: curves for the other countries …")
+    collected += from_fred(args.years)
 
     if not collected:
         # A transient outage (rate-limited runner, 403s) shouldn't redline the whole
