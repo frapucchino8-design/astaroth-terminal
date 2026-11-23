@@ -9,7 +9,7 @@ component indicators in the market_indicators table.
 Run supabase/migration_indicators.sql once first. Needs SUPABASE_URL and
 SUPABASE_SERVICE_ROLE_KEY, like the other scripts. No API key.
 """
-import json
+import datetime as dt
 import time
 
 import requests
@@ -47,13 +47,20 @@ def rating_for(score):
     return "Extreme Greed"
 
 
-def fetch():
-    headers = {"User-Agent": _UA, "Accept": "application/json",
-               "Origin": "https://edition.cnn.com", "Referer": "https://edition.cnn.com/"}
+# Raw series behind each signal, for the indicator charts (CNN feed key → stored key).
+SERIES = ["market_momentum_sp500", "market_momentum_sp125", "stock_price_strength",
+          "stock_price_breadth", "put_call_options", "market_volatility_vix",
+          "market_volatility_vix_50", "junk_bond_demand", "safe_haven_demand"]
+KEEP_DAYS = 5 * 366          # about five years of daily points
+_HEADERS = {"User-Agent": _UA, "Accept": "application/json",
+            "Origin": "https://edition.cnn.com", "Referer": "https://edition.cnn.com/"}
+
+
+def _get(url, tries=4):
     last = "no response"
-    for attempt in range(4):
+    for attempt in range(tries):
         try:
-            r = requests.get(URL, headers=headers, timeout=25)
+            r = requests.get(url, headers=_HEADERS, timeout=25)
         except requests.RequestException as e:
             last = e.__class__.__name__
         else:
@@ -65,7 +72,54 @@ def fetch():
             else:
                 last = f"HTTP {r.status_code}"
         time.sleep(2 * (attempt + 1))
-    raise SystemExit(f"Couldn't fetch the Fear & Greed feed ({last}).")
+    return last
+
+
+def fetch():
+    """The feed from as far back as CNN will give (up to 5 years), else the default year."""
+    today = dt.date.today()
+    for years in (5, 4, 3, 2):
+        start = today.replace(year=today.year - years)
+        got = _get(f"{URL}/{start.isoformat()}", tries=2)
+        if isinstance(got, dict) and (got.get("fear_and_greed") or {}).get("score") is not None:
+            log(f"Fear & Greed: history from {start}")
+            return got
+    got = _get(URL)
+    if isinstance(got, dict):
+        return got
+    raise SystemExit(f"Couldn't fetch the Fear & Greed feed ({got}).")
+
+
+def _daily(points, digits, keep=None):
+    """[[ms, value], …], one per day (latest wins), oldest first."""
+    by_day = {}
+    for pt in points or []:
+        if isinstance(pt, dict):
+            x, y = pt.get("x"), pt.get("y")
+        elif isinstance(pt, (list, tuple)) and len(pt) >= 2:
+            x, y = pt[0], pt[1]
+        else:
+            continue
+        y = num(y, digits=digits)
+        if y is None or not x:
+            continue
+        x = int(x)
+        by_day[x // 86_400_000] = [x, y]
+    out = [by_day[d] for d in sorted(by_day)]
+    if keep:
+        cut = (out[-1][0] if out else 0) - keep * 86_400_000
+        out = [p for p in out if p[0] >= cut]
+    return out
+
+
+def _stored(db):
+    """What's already saved, so the history keeps growing past what one feed call returns."""
+    try:
+        r = db.s.get(f"{db.url}/market_indicators?name=eq.fear_greed&select=extra", timeout=30)
+        rows = r.json() if r.status_code == 200 else []
+        return (rows[0].get("extra") or {}) if rows else {}
+    except (requests.RequestException, ValueError):
+        return {}
 
 
 def main():
@@ -94,14 +148,20 @@ def main():
         "year": num(fg.get("previous_1_year"), digits=1),
     }
 
-    # About a year of daily readings, for the history chart (one point per day).
-    by_day = {}
-    for pt in ((data.get("fear_and_greed_historical") or {}).get("data") or []):
-        y = num(pt.get("y"), digits=1)
-        if y is not None and pt.get("x"):
-            x = int(pt["x"])
-            by_day[x // 86_400_000] = [x, y]
-    hist = [by_day[d] for d in sorted(by_day)][-380:]
+    # Daily readings, merged with what was stored before, up to about five years.
+    old = _stored(db)
+    fresh = (data.get("fear_and_greed_historical") or {}).get("data") or []
+    hist = _daily(list(old.get("history") or []) + list(fresh), 1, KEEP_DAYS)
+
+    # The raw series behind each signal (S&P 500 and its 125-day average, VIX and its
+    # 50-day average, the put/call ratio, …), for the charts under the gauge.
+    old_series = old.get("series") or {}
+    series = {}
+    for key in SERIES:
+        pts = _daily(list(old_series.get(key) or []) + list((data.get(key) or {}).get("data") or []),
+                     4, KEEP_DAYS)
+        if pts:
+            series[key] = pts
 
     row = {
         "name": "fear_greed",
@@ -109,7 +169,7 @@ def main():
         "rating": rating,
         "as_of": fg.get("timestamp") or now_iso(),
         "extra": {"components": comps, "prev": prev, "history": hist,
-                  "source": "CNN Business"},
+                  "series": series, "source": "CNN Business"},
         "updated_at": now_iso(),
     }
     r = db.s.post(f"{db.url}/market_indicators?on_conflict=name", json=[row], timeout=60,
@@ -120,7 +180,7 @@ def main():
                              "Run supabase/migration_indicators.sql once, then run this again.")
         raise SystemExit(f"Saving the Fear & Greed row failed ({r.status_code}): {r.text[:300]}")
     log(f"Fear & Greed: {score:.0f} ({rating}). Saved with {len(comps)} components "
-        f"and {len(hist)} history points.")
+        f"and {len(hist)} history points ({len(series)} indicator series).")
 
 
 if __name__ == "__main__":
