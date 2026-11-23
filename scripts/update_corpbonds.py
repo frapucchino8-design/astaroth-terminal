@@ -80,8 +80,11 @@ def fetch_csv(ticker, pid):
         except requests.RequestException as e:
             last = e.__class__.__name__
         else:
-            if r.status_code == 200 and r.text and "," in r.text:
-                return r.text
+            if r.status_code == 200 and r.text and "," in r.text and not r.text.lstrip().startswith("<"):
+                return r.text.replace("\x00", "")
+            if r.status_code == 200:
+                log(f"  {ticker}: iShares sent a web page, not the CSV")
+                return None
             last = f"HTTP {r.status_code}"
         time.sleep(2 * (attempt + 1))
     log(f"  {ticker}: couldn't download holdings ({last})")
@@ -151,6 +154,94 @@ def parse_holdings(text, grade, source):
     return out
 
 
+# ---------------------------------------------------------------------------
+# SPDR fallback. BlackRock's holdings CSV link now returns an HTML page, so the
+# iShares path above often gets nothing. State Street publishes every SPDR
+# fund's daily holdings as a plain .xlsx — SPBO (investment-grade corporates)
+# and SPHY (high yield) together are ~4,000 US company bonds. They carry no
+# price or yield, so both are worked out here from market value, par, coupon
+# and maturity.
+# ---------------------------------------------------------------------------
+SPDR = [("SPBO", "IG"), ("SPHY", "HY")]
+SPDR_URL = "https://www.ssga.com/library-content/products/fund-data/etfs/us/holdings-daily-us-en-{t}.xlsx"
+_ISSUER_CUT = re.compile(r"\s+(?:SR|SENIOR|SECURED|SUBORD\w*|SUB|UNSECURED|COMPANY|GLOBAL|NOTES?|BONDS?|"
+                         r"144A|REGS|MTN|FIXED|VAR|JR|\d{2}/\d{2})\b.*$")
+
+
+def ytm_from_price(price, coupon, maturity_iso, today=None):
+    """Yield to maturity (%) for a semi-annual bond; price per 100 of par. Bisection."""
+    if not price or price <= 0 or coupon is None or not maturity_iso:
+        return None
+    today = today or dt.date.today()
+    years = (dt.date.fromisoformat(maturity_iso) - today).days / 365.25
+    if years <= 0.05:
+        return None
+    n = max(1, round(years * 2))
+    c = coupon / 2
+
+    def pv(y):
+        r = y / 200
+        if abs(r) < 1e-12:
+            return c * n + 100
+        return c * (1 - (1 + r) ** -n) / r + 100 * (1 + r) ** -n
+
+    lo, hi = -5.0, 80.0
+    if not (pv(hi) <= price <= pv(lo)):
+        return None
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        if pv(mid) > price:
+            lo = mid
+        else:
+            hi = mid
+    return round((lo + hi) / 2, 3)
+
+
+def fetch_spdr(ticker, grade):
+    try:
+        import openpyxl
+    except ImportError:
+        log("  openpyxl isn't installed — add it to scripts/requirements.txt.")
+        return []
+    try:
+        r = requests.get(SPDR_URL.format(t=ticker.lower()), headers={"User-Agent": _UA}, timeout=60)
+    except requests.RequestException as e:
+        log(f"  {ticker}: {e.__class__.__name__}")
+        return []
+    if r.status_code != 200 or not r.content.startswith(b"PK"):
+        log(f"  {ticker}: HTTP {r.status_code}, not a spreadsheet")
+        return []
+    ws = openpyxl.load_workbook(io.BytesIO(r.content), read_only=True, data_only=True).active
+    rows = list(ws.iter_rows(values_only=True))
+    head = next((i for i, row in enumerate(rows) if row and row[0] == "Name"), None)
+    if head is None:
+        return []
+    cols = {str(v).strip(): i for i, v in enumerate(rows[head]) if v}
+    get = lambda row, k: row[cols[k]] if k in cols and cols[k] < len(row) else None
+    out = []
+    for row in rows[head + 1:]:
+        name = (get(row, "Name") or "").strip() if isinstance(get(row, "Name"), str) else ""
+        isin = get(row, "Identifier")
+        if not name or not isin or "MONEY MARKET" in name.upper() or "CASH" == name.upper():
+            continue
+        coupon = to_float(get(row, "Coupon"))
+        par, mv = to_float(get(row, "Par Value")), to_float(get(row, "Market Value"))
+        mat = to_date(str(get(row, "Maturity") or ""))
+        price = round(mv / par * 100, 3) if par and mv else None
+        if price is not None and not (5 < price < 250):
+            price = None
+        out.append({
+            "id": str(isin), "isin": str(isin), "name": name,
+            "issuer": (_ISSUER_CUT.sub("", name).strip() or name).title(),
+            "sector": None, "grade": grade, "coupon": coupon, "maturity": mat,
+            "price": price, "ytm": ytm_from_price(price, coupon, mat),
+            "duration": None, "currency": get(row, "Local Currency") or "USD",
+            "source_etf": ticker, "weight": to_float(get(row, "Weight")),
+            "updated_at": now_iso(),
+        })
+    return out
+
+
 def upsert(db, rows):
     for i in range(0, len(rows), 500):
         batch = rows[i:i + 500]
@@ -181,6 +272,18 @@ def main():
         log(f"  {ticker}: parsed {len(rows)} bonds.")
         for row in rows:
             by_id[row["id"]] = row     # de-dupe across ETFs by CUSIP
+        time.sleep(1)
+
+    # iShares came back empty for a grade → take that grade from SPDR instead.
+    have = {r["grade"] for r in by_id.values()}
+    for ticker, grade in SPDR:
+        if grade in have or (args.only and args.only.upper() not in (ticker, "LQD" if grade == "IG" else "HYG")):
+            continue
+        log(f"{ticker}: iShares had no {grade} bonds — using SPDR's holdings …")
+        rows = fetch_spdr(ticker, grade)
+        log(f"  {ticker}: parsed {len(rows)} bonds.")
+        for row in rows:
+            by_id.setdefault(row["id"], row)
         time.sleep(1)
 
     rows = list(by_id.values())
