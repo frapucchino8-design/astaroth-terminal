@@ -106,10 +106,15 @@ def yahoo_symbol(s):
 
 def fetch_weekly(symbols, start):
     """{symbol: [(date, close), ...]} of weekly closes from `start`."""
+    return fetch_closes(symbols, start, "1wk")
+
+
+def fetch_closes(symbols, start, interval):
+    """{symbol: [(date, close), ...]} of closes at `interval` ("1wk" or "1d") from `start`."""
     out = {}
     ysyms = {s: yahoo_symbol(s) for s in symbols}
     try:
-        df = yf.download(" ".join(ysyms.values()), start=start.isoformat(), interval="1wk",
+        df = yf.download(" ".join(ysyms.values()), start=start.isoformat(), interval=interval,
                          progress=False, group_by="ticker", threads=True, auto_adjust=True)
     except Exception as e:
         log(f"  download failed for {len(symbols)} tickers: {e}")
@@ -180,6 +185,7 @@ def main():
         die(str(e) or "Supabase credentials are missing.")
 
     have = last_dates(db)
+    held = set()
     if args.only:
         symbols = [s.strip() for s in args.only.split(",") if s.strip()]
     else:
@@ -223,6 +229,26 @@ def main():
             done += len(part)
             log(f"  {done}/{len(symbols)} symbols · {total_rows:,} rows written")
             time.sleep(1)
+
+    # Daily closes for the last year, for the indices and everything people hold. The
+    # weekly bars above are dated the Monday a week starts, which makes short windows
+    # (a portfolio bought a few weeks ago against the S&P 500) come out flat or late.
+    if not args.only and not out_of_time():
+        daily_syms = list(dict.fromkeys(BENCHMARKS + sorted(held)))
+        daily_start = today - timedelta(days=400)
+        daily_rows = 0
+        for i in range(0, len(daily_syms), CHUNK):
+            if out_of_time():
+                break
+            part = daily_syms[i:i + CHUNK]
+            got = fetch_closes(part, daily_start, "1d")
+            rows = [{"symbol": s, "d": d.isoformat(), "close": v}
+                    for s in part for d, v in dict(got.get(s) or []).items()]
+            if rows:
+                upsert_history(db, rows)
+            daily_rows += len(rows)
+            time.sleep(1)
+        log(f"Daily closes for the last year: {daily_rows:,} rows for {len(daily_syms)} symbols.")
 
     if empty:
         log(f"Yahoo had nothing for {len(empty)}: {', '.join(empty[:25])}{' …' if len(empty) > 25 else ''}")
