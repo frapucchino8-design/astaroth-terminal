@@ -94,12 +94,14 @@ def main():
         "year": num(fg.get("previous_1_year"), digits=1),
     }
 
-    # A small recent history for a sparkline: the last ~60 daily readings.
-    hist = []
-    for pt in ((data.get("fear_and_greed_historical") or {}).get("data") or [])[-60:]:
+    # About a year of daily readings, for the history chart (one point per day).
+    by_day = {}
+    for pt in ((data.get("fear_and_greed_historical") or {}).get("data") or []):
         y = num(pt.get("y"), digits=1)
         if y is not None and pt.get("x"):
-            hist.append([int(pt["x"]), y])
+            x = int(pt["x"])
+            by_day[x // 86_400_000] = [x, y]
+    hist = [by_day[d] for d in sorted(by_day)][-380:]
 
     row = {
         "name": "fear_greed",
