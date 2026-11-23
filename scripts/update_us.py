@@ -247,6 +247,17 @@ def main():
         order="fundamentals_updated_at.asc.nullsfirst")]
     wanted = set(symbols)
     order = [s for s in order if s in wanted]
+    # Anything claiming $1T or more goes first: those are almost always a cap saved in
+    # the company's home currency (foreign ADRs) by an older run, and they wreck the
+    # screener's market-cap filter until they're rewritten.
+    try:
+        huge = {r["symbol"] for r in db.select(
+            "symbol", {"region": "eq.US", "asset_class": "in.(stock,reit)", "market_cap_usd_b": "gte.1000"})}
+    except RuntimeError:
+        huge = set()
+    if huge:
+        log(f"{len(huge)} stocks claim a market cap of $1T or more — refreshing those first.")
+        order = [s for s in order if s in huge] + [s for s in order if s not in huge]
     log(f"Refreshing fundamentals, oldest first ({len(order)} candidates) …")
     batch, done = [], 0
     for sym in order:
