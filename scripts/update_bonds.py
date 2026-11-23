@@ -18,9 +18,11 @@ Two sources:
             in one request, no key. The primary US source.
   Yahoo     four US index symbols. Only a fallback, for the rare case the
             Treasury feed is unreachable.
-  FRED      10-year benchmark yields for the other countries (Switzerland,
-            Germany, the UK, Japan, France, Italy, Canada and more), from the
-            Fed's keyless CSV download — no API key needed.
+  CNBC      whole government curves for 14 other countries (Switzerland,
+            Germany, the UK, Japan, France, Italy, Spain, Canada, Australia,
+            China, India, Brazil …), keyless. The primary non-US source.
+  FRED      10-year benchmarks, keyless CSV — only a fallback now, since that
+            endpoint times out from CI runners.
 
 It also writes weekly closes into price_history, so the "yield over time" chart
 in the site has something to draw. That needs migration_history.sql, which the
@@ -83,6 +85,34 @@ FRED = [
 ]
 
 FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+
+# ---------------------------------------------------------------------------
+# CNBC: whole government curves for the other countries, keyless. FRED's CSV
+# download times out from CI runners (and often everywhere), which is why only
+# the US curve used to show. CNBC symbols look like DE10Y-DE; a maturity a
+# country doesn't issue just comes back empty and is skipped.
+# ---------------------------------------------------------------------------
+CNBC_QUOTE_URL = "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol"
+CNBC_CHART_URL = "https://ts-api.cnbc.com/harmony/app/charts/5Y.json"
+CNBC_MATS = [("1M", 1 / 12), ("3M", 0.25), ("6M", 0.5), ("1Y", 1), ("2Y", 2), ("3Y", 3),
+             ("5Y", 5), ("7Y", 7), ("10Y", 10), ("20Y", 20), ("30Y", 30)]
+CNBC_COUNTRIES = [
+    # cnbc code, region,        country name,     currency
+    ("CH", "Switzerland", "Switzerland",    "CHF"),
+    ("DE", "Germany",     "Germany",        "EUR"),
+    ("GB", "UK",          "United Kingdom", "GBP"),
+    ("JP", "Japan",       "Japan",          "JPY"),
+    ("FR", "France",      "France",         "EUR"),
+    ("IT", "Italy",       "Italy",          "EUR"),
+    ("ES", "Spain",       "Spain",          "EUR"),
+    ("NL", "Netherlands", "Netherlands",    "EUR"),
+    ("CA", "Canada",      "Canada",         "CAD"),
+    ("AU", "Australia",   "Australia",      "AUD"),
+    ("CN", "China",       "China",          "CNY"),
+    ("IN", "India",       "India",          "INR"),
+    ("BR", "Brazil",      "Brazil",         "BRL"),
+    ("KR", "South Korea", "South Korea",    "KRW"),
+]
 
 # ---------------------------------------------------------------------------
 # US Treasury: the official Daily Par Yield Curve. One request returns the whole
@@ -350,6 +380,76 @@ def from_fred(years):
 
 
 # ---------------------------------------------------------------------------
+# CNBC
+# ---------------------------------------------------------------------------
+def _pct(v):
+    if v in (None, "", "UNCH"):
+        return None
+    try:
+        return float(str(v).replace("%", "").replace("+", "").replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _cnbc_history(symbol, years, session):
+    try:
+        r = session.get(CNBC_CHART_URL, params={"symbol": symbol}, headers={"User-Agent": _UA}, timeout=30)
+        bars = ((r.json().get("barData") or {}).get("priceBars") or []) if r.status_code == 200 else []
+    except (requests.RequestException, ValueError):
+        return []
+    cut = dt.date.today() - dt.timedelta(days=int(years * 365.25))
+    out = []
+    for b in bars:
+        v, t = _pct(b.get("close")), b.get("tradeTimeinMills")
+        if v is None or not t:
+            continue
+        d = dt.datetime.utcfromtimestamp(int(t) / 1000).date()
+        if d >= cut:
+            out.append((d, round(v, 4)))
+    return out
+
+
+def from_cnbc(years, want_history):
+    """[(row, [(date, yield)])] for every non-US curve CNBC carries."""
+    out = []
+    with requests.Session() as session:
+        for cc, region, country, currency in CNBC_COUNTRIES:
+            syms = "|".join(f"{cc}{lab}-{cc}" for lab, _ in CNBC_MATS)
+            params = {"symbols": syms, "requestMethod": "itv", "noform": "1", "partnerId": "2",
+                      "fund": "1", "exthrs": "1", "output": "json", "events": "1"}
+            try:
+                r = session.get(CNBC_QUOTE_URL, params=params, headers={"User-Agent": _UA}, timeout=30)
+                quotes = (r.json().get("FormattedQuoteResult") or {}).get("FormattedQuote") or []
+            except (requests.RequestException, ValueError) as e:
+                log(f"  CNBC {cc}: {e.__class__.__name__}")
+                continue
+            if isinstance(quotes, dict):
+                quotes = [quotes]
+            got = 0
+            for q in quotes:
+                if q.get("code") not in (0, "0"):
+                    continue
+                y = _pct(q.get("last"))
+                if y is None:
+                    continue
+                label = (q.get("symbol") or "").split("-")[0][len(cc):]
+                if label not in dict(CNBC_MATS):
+                    continue
+                prev = _pct(q.get("previous_day_closing"))
+                points = _cnbc_history(q["symbol"], years, session) if want_history else []
+                if want_history:
+                    time.sleep(0.25)
+                out.append((row_for(region, country, currency, label, y,
+                                    None if prev is None else y - prev,
+                                    _pct(q.get("yrhiprice")), _pct(q.get("yrloprice"))),
+                            points))
+                got += 1
+            log(f"  CNBC {cc}: {got} maturities")
+            time.sleep(0.4)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # History
 # ---------------------------------------------------------------------------
 def write_history(db, series):
@@ -405,8 +505,15 @@ def main():
             us = from_yahoo(args.years)
         collected += us
 
-    log("FRED: curves for the other countries …")
-    collected += from_fred(args.years)
+    log("CNBC: government curves for the other countries …")
+    collected += from_cnbc(args.years, not args.no_history)
+
+    # FRED only fills a country CNBC had nothing for (its CSV download is often unreachable).
+    have = {row["region"] for row, _ in collected}
+    if any(region not in have for _sid, region, *_ in FRED if region != "US"):
+        log("FRED: filling any country CNBC missed …")
+        collected += [(row, pts) for row, pts in from_fred(args.years)
+                      if row["region"] not in have]
 
     if not collected:
         # A transient outage (rate-limited runner, 403s) shouldn't redline the whole
