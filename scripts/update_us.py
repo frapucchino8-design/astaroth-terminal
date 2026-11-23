@@ -17,7 +17,7 @@ import time
 
 import requests
 
-from common import Supabase, env, finnhub_sector, log, now_iso, num
+from common import Supabase, env, finnhub_sector, log, now_iso, num, to_usd
 
 API = "https://finnhub.io/api/v1"
 EXCHANGES = {
@@ -256,7 +256,14 @@ def main():
         prof = fh.get("/stock/profile2", symbol=sym) or {}
         met = (fh.get("/stock/metric", symbol=sym, metric="all") or {}).get("metric") or {}
         pe = num(met.get("peTTM") or met.get("peBasicExclExtraTTM"), digits=2)
-        cap_m = prof.get("marketCapitalization") if prof.get("currency") in (None, "USD") else None
+        # Finnhub reports market cap in the company's own currency (millions):
+        # SQM's comes in Chilean pesos, TSM's in Taiwan dollars. Convert it, and
+        # never fall back to metric.marketCapitalization, which has the same problem.
+        cap_m = prof.get("marketCapitalization")
+        cap_cur = (prof.get("currency") or "USD").upper()
+        if cap_m and cap_cur != "USD":
+            rate = to_usd(cap_cur)
+            cap_m = cap_m * rate if rate else None
         industry = prof.get("finnhubIndustry")
         is_reit = asset_class_of(stocks[sym].get("type"), industry) == "reit"
         row = {
@@ -267,7 +274,7 @@ def main():
             "industry": industry or None,
             "sector": finnhub_sector(industry),
             "summary": None,  # Finnhub free doesn't carry company descriptions
-            "market_cap_usd_b": num(cap_m or met.get("marketCapitalization"), scale=0.001, digits=3),
+            "market_cap_usd_b": num(cap_m, scale=0.001, digits=3),
             "pe": pe if pe and pe > 0 else None,
             "pb": num(met.get("pbAnnual") or met.get("pbQuarterly"), digits=2),
             # FFO/AFFO aren't on the Finnhub free plan; left null for REITs — the website hides those columns when empty.
@@ -284,6 +291,8 @@ def main():
         }
         if row["name"] is None:
             row.pop("name")
+        if row["market_cap_usd_b"] is None:
+            row.pop("market_cap_usd_b")   # keep whatever the price job last saved
         batch.append(row)
         if len(batch) >= 100:
             db.upsert(batch)
