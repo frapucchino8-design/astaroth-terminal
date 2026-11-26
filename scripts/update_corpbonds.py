@@ -164,7 +164,7 @@ def parse_holdings(text, grade, source):
 # ---------------------------------------------------------------------------
 SPDR = [("SPBO", "IG"), ("SPHY", "HY")]
 SPDR_URL = "https://www.ssga.com/library-content/products/fund-data/etfs/us/holdings-daily-us-en-{t}.xlsx"
-_ISSUER_CUT = re.compile(r"\s+(?:SR|SENIOR|SECURED|SUBORD\w*|SUB|UNSECURED|COMPANY|GLOBAL|NOTES?|BONDS?|"
+_ISSUER_CUT = re.compile(r"\s+(?:SR|SENIOR|SECURED|SUBORD\w*|SUB|UNSECURED|NOTES?|BONDS?|"
                          r"144A|REGS|MTN|FIXED|VAR|JR|\d{2}/\d{2})\b.*$")
 
 
@@ -288,9 +288,9 @@ def main():
 
     rows = list(by_id.values())
     if not rows:
-        log("Nothing was fetched — iShares may be unreachable this run. Leaving the "
-            "existing rows in place; the next run will retry.")
-        return
+        # Fail the run (red in GitHub) so an empty result is never mistaken for success.
+        raise SystemExit("Nothing was fetched from iShares or SPDR — no bonds saved. If the log says "
+                         "openpyxl isn't installed, add 'openpyxl>=3.1' to scripts/requirements.txt.")
     upsert(db, rows)
     ig = sum(1 for r in rows if r["grade"] == "IG")
     log(f"Saved {len(rows)} corporate bonds ({ig} investment grade, {len(rows) - ig} high yield).")
