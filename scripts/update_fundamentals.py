@@ -31,6 +31,16 @@ Columns live in migration_fundamentals.sql and migration_fundamentals2.sql. Any
 that haven't been created yet are detected and simply left out of the write, so
 nothing fails before the migration is run.
 
+Balance-sheet figures come from Yahoo's fundamentals-timeseries feed (the data
+behind the Financials tab), because the old quoteSummary balanceSheetHistory
+module now returns only dates.
+
+Progress is tracked in its own column, deep_fundamentals_at
+(migration_deep_fundamentals.sql). It used to share fundamentals_updated_at with
+update_us.py, which stamps every stock several times a day, so this script
+always found "nothing stale" and wrote nothing. Names with no balance-sheet data
+yet always go first.
+
 Needs SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY, like the other scripts.
 """
 import argparse
@@ -70,7 +80,9 @@ class Yahoo:
 
     def __init__(self):
         self.s = requests.Session()
-        self.s.headers.update({"User-Agent": _UA, "Accept": "application/json"})
+        # Accept must stay generic: with "application/json" Yahoo's getcrumb answers
+        # 406 Not Acceptable, no crumb comes back and every read is empty.
+        self.s.headers.update({"User-Agent": _UA, "Accept": "*/*"})
         self.crumb = None
 
     def _bootstrap(self):
@@ -124,6 +136,60 @@ class Yahoo:
                 continue
             time.sleep(1.2 * (attempt + 1))
         return None
+
+
+TS_TYPES = ("TotalAssets", "StockholdersEquity", "TotalDebt", "AccountsReceivable",
+            "CashAndCashEquivalents", "CashCashEquivalentsAndShortTermInvestments",
+            "CurrentAssets", "CurrentLiabilities", "Inventory", "InvestedCapital",
+            "EBIT", "OperatingIncome", "NetIncome", "TotalRevenue", "FreeCashFlow",
+            "OrdinarySharesNumber")
+
+
+def timeseries(yahoo, sym):
+    """{field: [(year, value)] newest-first} of annual statement lines, or {}."""
+    if yahoo.crumb is None and not yahoo._bootstrap():
+        return {}
+    now = int(time.time())
+    params = {"type": ",".join("annual" + t for t in TS_TYPES),
+              "period1": now - 12 * 365 * 86400, "period2": now, "crumb": yahoo.crumb}
+    for attempt in range(3):
+        host = _HOSTS[attempt % 2]
+        try:
+            r = yahoo.s.get(f"https://{host}/ws/fundamentals-timeseries/v1/finance/timeseries/{sym}",
+                            params=params, timeout=25)
+        except requests.RequestException:
+            time.sleep(1.2 * (attempt + 1))
+            continue
+        if r.status_code == 200:
+            try:
+                results = (r.json().get("timeseries") or {}).get("result") or []
+            except ValueError:
+                return {}
+            out = {}
+            for res in results:
+                t = ((res.get("meta") or {}).get("type") or [None])[0]
+                pts = []
+                for v in res.get(t) or []:
+                    if not v:
+                        continue
+                    val = num(((v.get("reportedValue") or {}).get("raw")))
+                    year = (v.get("asOfDate") or "")[:4]
+                    if val is not None and year.isdigit():
+                        pts.append((int(year), val))
+                if t and pts:
+                    out[t[len("annual"):]] = sorted(pts, reverse=True)
+            return out
+        if r.status_code == 429:
+            time.sleep(6 * (attempt + 1))
+            continue
+        if r.status_code in (401, 403):
+            yahoo.crumb = None
+            if not yahoo._bootstrap():
+                return {}
+            params["crumb"] = yahoo.crumb
+            continue
+        return {}
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +285,9 @@ def growth_windows(series):
             if year is None:
                 continue
             span = newest_year - year
-            if 0 < span <= window and (best is None or span > best[0]):
+            # only a span that really covers the window — a 3-year figure must not
+            # be passed off as the 5- or 10-year one
+            if span >= window and (best is None or span < best[0]):
                 best = (span, v)
         if best:
             out[key] = cagr(newest, best[1], best[0])
@@ -229,7 +297,7 @@ def growth_windows(series):
 # ---------------------------------------------------------------------------
 # Turn one quoteSummary result into a row of columns
 # ---------------------------------------------------------------------------
-def build_row(res, currency):
+def build_row(res, currency, ts=None):
     sd = res.get("summaryDetail") or {}
     ks = res.get("defaultKeyStatistics") or {}
     fd = res.get("financialData") or {}
@@ -238,6 +306,14 @@ def build_row(res, currency):
     bs = (res.get("balanceSheetHistory") or {}).get("balanceSheetStatements") or []
 
     fx = to_usd(currency) or 1.0
+    # Statement figures are in the company's reporting currency, which can differ
+    # from the trading currency (ADRs, some Swiss listings report in USD/EUR).
+    fin_cur = (fd.get("financialCurrency") or currency or "USD")
+    if isinstance(fin_cur, dict):
+        fin_cur = fin_cur.get("raw") or currency
+    fx_fin = (to_usd(fin_cur) if fin_cur != currency else fx) or fx
+    ts = ts or {}
+    latest = lambda k: (ts.get(k) or [(None, None)])[0][1]
     rec = {}
 
     def put(col, val):
@@ -326,31 +402,94 @@ def build_row(res, currency):
         put(k, v)
 
     # ---- balance sheet ----
-    total_assets = next((v for _, v in annual_series(bs, "totalAssets")), None)
-    equity = next((v for _, v in annual_series(
-        bs, "totalStockholderEquity", "stockholdersEquity")), None)
-    receivables = next((v for _, v in annual_series(
-        bs, "netReceivables", "accountsReceivable")), None)
+    # Newest annual statement from the timeseries feed; the old quoteSummary
+    # balanceSheetHistory module is only a fallback (Yahoo now leaves it empty).
+    first = lambda *names: next((v for _, v in annual_series(bs, *names)), None)
+    total_assets = latest("TotalAssets") or first("totalAssets")
+    equity = latest("StockholdersEquity") or first("totalStockholderEquity", "stockholdersEquity")
+    receivables = latest("AccountsReceivable")
+    if receivables is None:
+        receivables = first("netReceivables", "accountsReceivable")
     total_debt = g(fd, "totalDebt")
+    if total_debt is None:
+        total_debt = latest("TotalDebt")
     cash = g(fd, "totalCash")
     if cash is None:
-        cash = next((v for _, v in annual_series(bs, "cash", "cashAndCashEquivalents")), None)
+        cash = latest("CashCashEquivalentsAndShortTermInvestments") or latest("CashAndCashEquivalents") \
+            or first("cash", "cashAndCashEquivalents")
+    stmt_revenue = latest("TotalRevenue") or revenue
 
     if total_assets and total_debt is not None:
         put("debt_to_assets", round(total_debt / total_assets * 100, 2))
     if total_assets and cash is not None:
         put("cash_pct_assets", round(cash / total_assets * 100, 2))
     if cash is not None:
-        put("cash_usd_m", round(cash * fx / 1e6, 2))
-    if revenue and receivables is not None:
-        put("receivable_days", round(receivables / revenue * 365, 1))
+        put("cash_usd_m", round(cash * fx_fin / 1e6, 2))
+    if stmt_revenue and receivables is not None:
+        put("receivable_days", round(receivables / stmt_revenue * 365, 1))
 
-    # ROIC = EBIT after an assumed tax, over invested capital
-    ebit = next((v for _, v in annual_series(inc, "ebit", "operatingIncome")), None)
-    if ebit is not None and equity and total_debt is not None:
+    # Liquidity and leverage when financialData has none (common outside the US)
+    ca, cl, inv = latest("CurrentAssets"), latest("CurrentLiabilities"), latest("Inventory")
+    if "current_ratio" not in rec and ca and cl:
+        put("current_ratio", round(ca / cl, 3))
+    if "quick_ratio" not in rec and ca and cl:
+        put("quick_ratio", round((ca - (inv or 0)) / cl, 3))
+    if "debt_to_equity" not in rec and total_debt is not None and equity and equity > 0:
+        put("debt_to_equity", round(total_debt / equity * 100, 2))
+    if "roe" not in rec and equity and equity > 0 and latest("NetIncome") is not None:
+        put("roe", round(latest("NetIncome") / equity * 100, 2))
+    if "roa" not in rec and total_assets and latest("NetIncome") is not None:
+        put("roa", round(latest("NetIncome") / total_assets * 100, 2))
+    if "book_value_ps" not in rec and equity and shares:
+        put("book_value_ps", round(equity * fx_fin / fx / shares, 4))
+    if "fcf_ps" not in rec and latest("FreeCashFlow") is not None and shares:
+        put("fcf_ps", round(latest("FreeCashFlow") * fx_fin / fx / shares, 4))
+
+    # ROIC = EBIT after an assumed tax, over invested capital (debt + equity − cash)
+    ebit = latest("EBIT") or latest("OperatingIncome") or first("ebit", "operatingIncome")
+    invested = None
+    if equity and total_debt is not None:
         invested = equity + total_debt - (cash or 0)
-        if invested and invested > 0:
-            put("roic", round(ebit * (1 - TAX) / invested * 100, 2))
+    if (not invested or invested <= 0) and latest("InvestedCapital"):
+        invested = latest("InvestedCapital")
+    if ebit is not None and invested and invested > 0:
+        put("roic", round(ebit * (1 - TAX) / invested * 100, 2))
+
+    # Multi-year earnings growth: the timeseries reaches further back than the
+    # quoteSummary income history, so prefer it when it has more years.
+    ni_ts = ts.get("NetIncome") or []
+    if len(ni_ts) > len(ni_series):
+        for k, v in growth_windows(ni_ts).items():
+            put(k, v)
+
+    # ---- reporting currency ≠ trading currency (ADRs such as TSM, BABA) ----
+    # Yahoo then divides a USD price by per-share figures in TWD/CNY/…, and its
+    # enterprise value is in the reporting currency, so P/B, P/S, EV/EBITDA and the
+    # per-share numbers come out wildly wrong. Rebuild them from the market cap
+    # (trading currency) and the statements converted into the trading currency.
+    price = g(pr, "regularMarketPrice") or g(fd, "currentPrice")
+    n_eff = cap / price if cap and price else None   # shares in listing units
+    if n_eff and fin_cur == currency:
+        # Same currency: Yahoo's ratios are fine, but its share count can cover only
+        # one share class (Roche counts just its bearer shares), so per-share
+        # figures use market cap ÷ price instead.
+        if fcf is not None:
+            put("fcf_ps", round(fcf / n_eff, 4))
+        if revenue:
+            put("revenue_ps", round(revenue / n_eff, 4))
+    if fin_cur != currency and n_eff and fx_fin and fx:
+        k = fx_fin / fx                      # reporting → trading currency
+        if equity and equity > 0:
+            put("pb", round(cap / (equity * k), 3))
+            put("book_value_ps", round(equity * k / n_eff, 4))
+        if revenue:
+            put("ps", round(cap / (revenue * k), 4))
+            put("revenue_ps", round(revenue * k / n_eff, 4))
+        if ebitda and ebitda > 0:
+            ev = cap + ((total_debt or 0) - (cash or 0)) * k
+            put("ev_ebitda", round(ev / (ebitda * k), 3))
+        if fcf is not None:
+            put("fcf_ps", round(fcf * k / n_eff, 4))
 
     return rec
 
@@ -394,12 +533,19 @@ def main():
     filters = {"asset_class": "in.(stock,reit)"}
     if args.region:
         filters["region"] = f"eq.{args.region}"
-    rows = db.select("symbol,currency,region,fundamentals_updated_at", filters,
-                     order="fundamentals_updated_at.asc.nullsfirst")
-    if args.stale_days:
+    # Progress lives in deep_fundamentals_at. fundamentals_updated_at is also
+    # stamped by update_us.py several times a day, so using it made every stock
+    # look fresh and this script did nothing.
+    stamp = "deep_fundamentals_at" if existing_columns(db, ["deep_fundamentals_at"]) else None
+    if not stamp:
+        log("  deep_fundamentals_at isn't in the database yet — run "
+            "supabase/migration_deep_fundamentals.sql. Until then every stock counts as stale.")
+    cols = "symbol,currency,region" + (f",{stamp}" if stamp else "")
+    rows = db.select(cols, filters, order=f"{stamp}.asc.nullsfirst" if stamp else "symbol")
+    if args.stale_days and stamp:
         cutoff = time.time() - args.stale_days * 86400
         def is_stale(r):
-            ts = r.get("fundamentals_updated_at")
+            ts = r.get(stamp)
             if not ts:
                 return True
             try:
@@ -407,6 +553,14 @@ def main():
             except (ValueError, AttributeError):
                 return True
         rows = [r for r in rows if is_stale(r)]
+    # Names that still have no balance-sheet data go first.
+    try:
+        bare = {r["symbol"] for r in db.select("symbol", {**filters, "debt_to_assets": "is.null"})}
+    except RuntimeError:
+        bare = set()
+    if bare:
+        rows = [r for r in rows if r["symbol"] in bare] + [r for r in rows if r["symbol"] not in bare]
+        log(f"  {len(bare)} have no balance-sheet data yet — doing those first.")
     if args.limit:
         rows = rows[: args.limit]
 
@@ -441,7 +595,7 @@ def main():
             continue
 
         currency = row.get("currency") or ((res.get("price") or {}).get("currency")) or "USD"
-        rec = build_row(res, currency)
+        rec = build_row(res, currency, timeseries(yahoo, sym))
         rec = {k: v for k, v in rec.items() if k in allowed}
         if not rec:
             skipped += 1
@@ -450,6 +604,8 @@ def main():
         rec["symbol"] = sym
         rec["region"] = row.get("region") or "US"
         rec["fundamentals_updated_at"] = now_iso()
+        if stamp:
+            rec[stamp] = now_iso()
         batch.append(rec)
 
         if len(batch) >= 40:
