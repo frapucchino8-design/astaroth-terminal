@@ -99,6 +99,15 @@ def main():
 
     fh = Finnhub(env("FINNHUB_API_KEY"))
     db = None if args.check else Supabase()
+    # The multi-year EPS growth columns come from migration_deep_fundamentals.sql;
+    # only write them once they exist, so a missing migration never breaks this run.
+    multi_eps = False
+    if db:
+        try:
+            multi_eps = db.s.get(f"{db.url}/stocks", params={"select": "eps_growth_3y,eps_growth_5y", "limit": "1"},
+                                 timeout=30).status_code < 300
+        except requests.RequestException:
+            pass
 
     # 1. The list of US stocks ------------------------------------------------
     listing = fh.get("/stock/symbol", exchange="US") or []
@@ -293,13 +302,23 @@ def main():
             "return_1y": num(met.get("52WeekPriceReturnDaily"), digits=2),
             "beta": num(met.get("beta"), digits=3),
             "revenue_growth": num(met.get("revenueGrowthTTMYoy"), digits=2),
-            "eps_growth": next((v for v in (num(met.get(k), digits=2) for k in
-                               ("epsGrowth5Y", "epsGrowth3Y", "epsGrowthTTMYoy")) if v is not None), None),
+            # 1-year growth here; the 3- and 5-year figures go in their own columns
+            # (this used to put the 5-year number in "EPS growth", so PEG was off)
+            "eps_growth": num(met.get("epsGrowthTTMYoy"), digits=2),
             "net_margin": num(met.get("netProfitMarginTTM"), digits=2),
             "high_52w": num(met.get("52WeekHigh")),
             "low_52w": num(met.get("52WeekLow")),
             "fundamentals_updated_at": now_iso(),
         }
+        if multi_eps:
+            row["eps_growth_3y"] = num(met.get("epsGrowth3Y"), digits=2)
+            row["eps_growth_5y"] = num(met.get("epsGrowth5Y"), digits=2)
+        # never blank a value another script (update_fundamentals.py) already filled.
+        # pe and dividend_yield are left in: a loss or a cut dividend should clear them.
+        for k in ("eps_growth", "eps_growth_3y", "eps_growth_5y", "pb",
+                  "beta", "revenue_growth", "net_margin", "return_1y", "high_52w", "low_52w"):
+            if row.get(k) is None:
+                row.pop(k, None)
         if row["name"] is None:
             row.pop("name")
         if row["market_cap_usd_b"] is None:
